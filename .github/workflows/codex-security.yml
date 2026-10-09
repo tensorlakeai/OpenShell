@@ -119,13 +119,14 @@ jobs:
 
       - name: Install Codex Security
         run: |
-          set -euo pipefail
-          npm install \
-            --prefix "$RUNNER_TEMP/codex-security" \
-            --ignore-scripts \
-            --no-audit \
-            --no-fund \
-            @openai/codex-security@0.1.24
+          npm install --global --ignore-scripts pnpm@11.28.5
+          mkdir -p "$RUNNER_TEMP/codex-security"
+          pnpm --dir "$RUNNER_TEMP/codex-security" \
+            --config.minimumReleaseAge=1440 --config.minimumReleaseAgeStrict=true \
+            --config.minimumReleaseAgeIgnoreMissingTime=false --config.trustLockfile=false \
+            --config.blockExoticSubdeps=true --config.strictDepBuilds=true \
+            --config.optimisticRepeatInstall=false \
+            add --ignore-scripts --save-exact @openai/codex-security@0.1.24
 
       - name: Verify Codex Security
         env:

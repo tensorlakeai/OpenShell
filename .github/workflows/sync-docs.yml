@@ -209,7 +209,15 @@ jobs:
         working-directory: docs-website
         run: |
           FERN_VERSION=$(node -p "require('./fern/fern.config.json').version")
-          npm install -g "fern-api@${FERN_VERSION}"
+          npm install --global --ignore-scripts pnpm@11.28.5
+          mkdir -p "$RUNNER_TEMP/fern-tools"
+          pnpm --dir "$RUNNER_TEMP/fern-tools" \
+            --config.minimumReleaseAge=1440 --config.minimumReleaseAgeStrict=true \
+            --config.minimumReleaseAgeIgnoreMissingTime=false --config.trustLockfile=false \
+            --config.blockExoticSubdeps=true --config.strictDepBuilds=true \
+            --config.optimisticRepeatInstall=false \
+            add --ignore-scripts --save-exact "fern-api@${FERN_VERSION}"
+          echo "$RUNNER_TEMP/fern-tools/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Validate docs website
         working-directory: docs-website/fern

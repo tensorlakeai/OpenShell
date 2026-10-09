@@ -20,7 +20,7 @@ RUN useradd \
     --shell /bin/bash \
     sandbox
 
-RUN npm install --global --force "@openai/codex@latest" \
+RUN npm install --global --ignore-scripts pnpm@11.28.5 && mkdir -p /usr/local/lib/tensorlake-tools && (test -f /usr/local/lib/tensorlake-tools/package.json || printf '%s\n' '{"private":true,"packageManager":"pnpm@11.28.5"}' > /usr/local/lib/tensorlake-tools/package.json) && pnpm --dir /usr/local/lib/tensorlake-tools --config.minimumReleaseAge=1440 --config.minimumReleaseAgeStrict=true --config.minimumReleaseAgeIgnoreMissingTime=false --config.trustLockfile=false --config.blockExoticSubdeps=true --config.strictDepBuilds=true --config.optimisticRepeatInstall=false add --ignore-scripts --save-exact @openai/codex@0.161.0 && for executable in /usr/local/lib/tensorlake-tools/node_modules/.bin/*; do [ ! -e "$executable" ] || ln -sf "$executable" /usr/local/bin/; done \
     && npm cache clean --force \
     && codex --version
 

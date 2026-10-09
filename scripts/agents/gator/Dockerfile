@@ -55,7 +55,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
         vim-tiny \
         nano \
     && rm -rf /var/lib/apt/lists/* \
-    && npm install -g npm@11.11.0
+    && npm install --global --ignore-scripts npm@11.11.0
 
 # GitHub CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -66,7 +66,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     rm -rf /var/lib/apt/lists/*
 
 ARG CODEX_VERSION=latest
-RUN npm install -g "@openai/codex@${CODEX_VERSION}" && \
+RUN npm install --global --ignore-scripts pnpm@11.28.5 && mkdir -p /usr/local/lib/tensorlake-tools && (test -f /usr/local/lib/tensorlake-tools/package.json || printf '%s\n' '{"private":true,"packageManager":"pnpm@11.28.5"}' > /usr/local/lib/tensorlake-tools/package.json) && pnpm --dir /usr/local/lib/tensorlake-tools --config.minimumReleaseAge=1440 --config.minimumReleaseAgeStrict=true --config.minimumReleaseAgeIgnoreMissingTime=false --config.trustLockfile=false --config.blockExoticSubdeps=true --config.strictDepBuilds=true --config.optimisticRepeatInstall=false add --ignore-scripts --save-exact "@openai/codex@${CODEX_VERSION}" && for executable in /usr/local/lib/tensorlake-tools/node_modules/.bin/*; do [ ! -e "$executable" ] || ln -sf "$executable" /usr/local/bin/; done && \
     (npm cache clean --force >/dev/null 2>&1 || true) && \
     codex --version
 
