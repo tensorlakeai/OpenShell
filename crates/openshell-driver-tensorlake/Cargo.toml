@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-driver-tensorlake"
+description = "Tensorlake compute driver for OpenShell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "openshell-driver-tensorlake"
+path = "src/main.rs"
+
+[dependencies]
+openshell-core = { path = "../openshell-core", default-features = false }
+openshell-otel = { path = "../openshell-otel" }
+openshell-isolation-interface = { path = "../openshell-isolation-interface" }
+openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
+tar = "0.4"
+
+tokio = { workspace = true }
+tonic = { workspace = true, features = ["transport"] }
+futures = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
+reqwest = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+miette = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
