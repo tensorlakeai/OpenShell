@@ -55,15 +55,49 @@ recipe. It cannot inspect the VM to confirm them.
 
 Tensorlake `allow_out` is an optional second wall for the guard's own egress.
 
-## Build the image
+## Build the images
+
+`build-images.sh` builds two images on Tensorlake. A Tensorlake builder
+sandbox runs each build, so local Docker is not needed.
+
+| Image | Default name | Contents |
+|---|---|---|
+| Sandbox | `openshell-tensorlake` | guard, workload runtime, launcher |
+| Control | `openshell-control` | gateway, this driver, start script |
 
 ```shell
-docker build -f crates/openshell-driver-tensorlake/image/Dockerfile \
-  --build-arg OPENSHELL_TAG=<release tag> -t openshell-tensorlake .
+crates/openshell-driver-tensorlake/build-images.sh
 ```
 
-Register the image with Tensorlake (`tl sbx image create`). The image must
-not contain `/.openshell`. Derive from it to add agent tools.
+The control image records the sandbox image name. The driver uses that
+sandbox image unless `OPENSHELL_SANDBOX_IMAGE` is set, so the two images
+always work as a pair.
+
+The script copies the Rust source of your checkout, with uncommitted
+changes, into a temporary build context. Tensorlake uses the Dockerfile
+directory as the context, and does not expand variables in `FROM`. So both
+Dockerfiles pin the upstream OpenShell images to the upstream commit that
+this branch is based on. Change the pin when you rebase.
+
+The sandbox image must not contain `/.openshell`. Derive from it to add agent
+tools.
+
+### Publish for all Tensorlake users
+
+Build from a clean checkout, in the project that owns the public images:
+
+```shell
+PUBLIC=1 VERSION=0-1-5 crates/openshell-driver-tensorlake/build-images.sh
+```
+
+This registers `openshell-tensorlake-0-1-5` and `openshell-control-0-1-5`
+with `--public`. Any Tensorlake project can then use them without a build.
+Public names must be unique across Tensorlake, and Tensorlake has no image
+tags, so put the version in the name. Do not replace a published version;
+publish a new one.
+
+The images contain no keys. The control plane creates its signing keys at
+first start, and `deploy.sh` uploads the Tensorlake key at deploy time.
 
 ## Run
 
@@ -76,6 +110,7 @@ export TENSORLAKE_API_KEY=...
 openshell-driver-tensorlake \
   --bind-socket /run/openshell/tensorlake.sock \
   --grpc-endpoint https://gateway.example.com:8080 \
+  --gateway-tls-ca /etc/openshell/gateway-ca.pem \
   --sandbox-image openshell-tensorlake \
   --allow-out api.anthropic.com,github.com
 
@@ -87,7 +122,7 @@ openshell-gateway --compute-driver tensorlake \
 |---|---|---|
 | `--bind-socket` | `OPENSHELL_COMPUTE_DRIVER_SOCKET` | required |
 | `--grpc-endpoint` | `OPENSHELL_GRPC_ENDPOINT` | required |
-| `--gateway-tls-ca` | `OPENSHELL_TENSORLAKE_GATEWAY_TLS_CA` | none |
+| `--gateway-tls-ca` | `OPENSHELL_TENSORLAKE_GATEWAY_TLS_CA` | required for an `https` endpoint |
 | `--tensorlake-api-url` | `TENSORLAKE_API_URL` | `https://sandbox.tensorlake.ai` |
 | `--tensorlake-api-key` | `TENSORLAKE_API_KEY` | required |
 | `--sandbox-image` | `OPENSHELL_SANDBOX_IMAGE` | required |
@@ -96,8 +131,72 @@ openshell-gateway --compute-driver tensorlake \
 | `--allow-out` | `OPENSHELL_TENSORLAKE_ALLOW_OUT` | empty (internet on) |
 | `--poll-interval-secs` | `OPENSHELL_TENSORLAKE_POLL_INTERVAL_SECS` | 3 |
 
+The guard trusts only the `--gateway-tls-ca` bundle, not public roots. For a
+gateway with a public certificate, pass the root CA that signed it.
+
 When `--allow-out` is set, the driver turns off Tensorlake internet access and
 adds the gateway host to the list.
+
+## Run the control plane on Tensorlake
+
+`control/` runs the gateway and this driver together in one long-lived
+Tensorlake sandbox.
+
+```
+ your machine                    Tensorlake
+┌──────────────┐  tl tunnel    ┌───────────────────────────────────┐
+│ openshell CLI│ ────────────► │ control sandbox                   │
+└──────────────┘               │  gateway :8080 (plaintext HTTP/2) │
+                               │    ▲ UDS                          │
+                               │  driver ──► Tensorlake API        │
+                               └────▲──────────────────────────────┘
+                                    │ https://8080-<name>.sandbox.tensorlake.ai
+                               guards in sandbox VMs (public port, TLS at proxy)
+```
+
+The Tensorlake port proxy terminates TLS. Guards trust the public CA bundle
+of the control image for that certificate.
+
+1. Build the images (see [Build the images](#build-the-images)), or use
+   published ones.
+
+2. Create the sandbox and start the control plane:
+
+   ```shell
+   export TENSORLAKE_API_KEY=...
+   export OPENSHELL_OIDC_ISSUER=https://issuer.example.com
+   export CONTROL_IMAGE=openshell-control-0-1-5   # or your own build
+   crates/openshell-driver-tensorlake/control/deploy.sh
+   ```
+
+   The script stores settings in `/etc/openshell-control/control.env` (mode
+   0600) and starts a managed process with `--restart always`. Run it again
+   to change settings. Gateway state stays in `/var/lib/openshell`. Set
+   `OPENSHELL_DB_URL` to use an external database.
+
+3. Connect the CLI. With OIDC, use the public URL:
+
+   ```shell
+   openshell gateway add https://8080-openshell-control.sandbox.tensorlake.ai \
+     --oidc-issuer https://issuer.example.com
+   ```
+
+   Without OIDC, use a Tensorlake tunnel:
+
+   ```shell
+   tl sbx tunnel openshell-control 8080 --listen-port 18080
+   openshell gateway add http://127.0.0.1:18080 --name tensorlake
+   ```
+
+Guards cannot hold a Tensorlake key, so port 8080 accepts anonymous
+requests. The gateway must authenticate users itself. The start script
+refuses to run without `OPENSHELL_OIDC_ISSUER`, unless you set
+`OPENSHELL_CONTROL_ALLOW_UNAUTHENTICATED=1`. With that setting, anyone with
+the URL controls the gateway. Use it only for a short test with
+non-production credentials.
+
+The control sandbox holds the Tensorlake API key. Do not run other workloads
+in it.
 
 ## Limits
 
@@ -117,4 +216,6 @@ end-to-end run on Tensorlake still needs to confirm that:
 
 - the guest kernel enables Landlock and seccomp, and allows `unshare --net`;
 - the file API writes as root, and the process API runs the launcher as root;
-- the guard can reach the gateway over a long-lived gRPC connection.
+- the guard can reach the gateway over a long-lived gRPC connection;
+- the port proxy sends gRPC to a plaintext HTTP/2 backend, and keeps
+  long-lived streams open.

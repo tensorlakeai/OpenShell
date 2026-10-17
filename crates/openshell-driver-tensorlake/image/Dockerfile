@@ -7,18 +7,17 @@
 # (openshell-sandbox), and the launcher to an Ubuntu base. Add agent tools
 # (for example Claude Code) in a derived image.
 #
-# Build from the repository root:
-#   docker build -f crates/openshell-driver-tensorlake/image/Dockerfile \
-#     --build-arg OPENSHELL_TAG=<release tag> -t openshell-tensorlake .
-# Then register the image with Tensorlake (`tl sbx image create`).
+# Build and register it on Tensorlake with ../build-images.sh (no local
+# Docker needed).
+#
+# Tensorlake uses this directory as the build context, and does not expand
+# variables in FROM, so the image tags are fixed here. Pin the upstream
+# commit this branch is based on, the same as control/Dockerfile.
 
-ARG OPENSHELL_TAG=latest
-ARG BASE_IMAGE=ubuntu:24.04
+FROM ghcr.io/nvidia/openshell/supervisor:a4c848adbddd0b4732fd70ddcf8a563a5b1e9317 AS supervisor
+FROM ghcr.io/nvidia/openshell/sandbox:a4c848adbddd0b4732fd70ddcf8a563a5b1e9317 AS sandbox
 
-FROM ghcr.io/nvidia/openshell/supervisor:${OPENSHELL_TAG} AS supervisor
-FROM ghcr.io/nvidia/openshell/sandbox:${OPENSHELL_TAG} AS sandbox
-
-FROM ${BASE_IMAGE}
+FROM ubuntu:24.04
 
 # iproute2: loopback in the workload network namespace.
 # util-linux: unshare and setpriv. ca-certificates: guard TLS to upstreams.
@@ -33,9 +32,10 @@ RUN if ! getent group 1000 >/dev/null; then groupadd --gid 1000 sandbox; fi \
        fi \
     && install -d -m 0755 /sandbox /var/lib/openshell
 
-COPY --from=supervisor --chmod=0555 /openshell-supervisor /opt/openshell/bin/openshell-supervisor
-COPY --from=sandbox --chmod=0555 /openshell-sandbox /opt/openshell/bin/openshell-sandbox
-COPY --chmod=0555 crates/openshell-driver-tensorlake/image/openshell-tensorlake-launch.sh \
+COPY --from=supervisor /openshell-supervisor /opt/openshell/bin/openshell-supervisor
+COPY --from=sandbox /openshell-sandbox /opt/openshell/bin/openshell-sandbox
+COPY openshell-tensorlake-launch.sh /opt/openshell/bin/openshell-tensorlake-launch
+RUN chmod 0555 /opt/openshell/bin/openshell-supervisor /opt/openshell/bin/openshell-sandbox \
     /opt/openshell/bin/openshell-tensorlake-launch
 
 WORKDIR /sandbox
