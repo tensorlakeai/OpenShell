@@ -29,8 +29,8 @@ pub struct TensorlakeComputeConfig {
     pub default_image: String,
     /// Gateway gRPC endpoint that the guard in each VM dials.
     pub grpc_endpoint: String,
-    /// Optional gateway CA bundle (PEM). Required when the gateway uses a
-    /// private CA.
+    /// Gateway CA bundle (PEM). Required for an https endpoint, because the
+    /// guard trusts only this CA.
     pub gateway_tls_ca: Option<PathBuf>,
     pub default_cpus: f64,
     pub default_memory_mb: i64,
@@ -78,8 +78,23 @@ impl TensorlakeComputeConfig {
                     .into(),
             );
         }
-        url::Url::parse(&self.grpc_endpoint)
+        let endpoint = url::Url::parse(&self.grpc_endpoint)
             .map_err(|error| format!("invalid gateway gRPC endpoint: {error}"))?;
+        match endpoint.scheme() {
+            // The guard trusts only OPENSHELL_TLS_CA and has no public roots.
+            "https" if self.gateway_tls_ca.is_none() => {
+                return Err(
+                    "an https gateway gRPC endpoint requires a gateway CA bundle; the guard trusts only that CA"
+                        .into(),
+                );
+            }
+            "http" | "https" => {}
+            other => {
+                return Err(format!(
+                    "gateway gRPC endpoint must use http or https, got '{other}'"
+                ));
+            }
+        }
         url::Url::parse(&self.api_url)
             .map_err(|error| format!("invalid Tensorlake API URL: {error}"))?;
         if self.default_cpus.is_nan() || self.default_cpus <= 0.0 || self.default_memory_mb <= 0 {
@@ -153,6 +168,19 @@ pub(crate) mod tests {
     fn validate_rejects_missing_endpoint() {
         let mut config = test_config();
         config.grpc_endpoint.clear();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_requires_ca_for_https_endpoint() {
+        let mut config = test_config();
+        assert!(config.validate().unwrap_err().contains("CA bundle"));
+        config.gateway_tls_ca = Some(PathBuf::from("/etc/openshell/gateway-ca.pem"));
+        assert!(config.validate().is_ok());
+        config.gateway_tls_ca = None;
+        config.grpc_endpoint = "http://gateway.example.com:8080".into();
+        assert!(config.validate().is_ok());
+        config.grpc_endpoint = "ftp://gateway.example.com".into();
         assert!(config.validate().is_err());
     }
 }

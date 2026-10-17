@@ -669,13 +669,8 @@ impl TensorlakeComputeDriver {
     }
 
     async fn poll_once(&self) -> Result<(), TensorlakeError> {
-        let observed: HashMap<String, SandboxInfo> = self
-            .client
-            .list_sandboxes()
-            .await?
-            .into_iter()
-            .map(|info| (info.sandbox_id.clone(), info))
-            .collect();
+        // Read the records before the Tensorlake list. A record created after
+        // this point is not in the list yet and must not look terminated.
         let records: Vec<(String, Record)> = self
             .records
             .lock()
@@ -683,33 +678,52 @@ impl TensorlakeComputeDriver {
             .iter()
             .map(|(id, record)| (id.clone(), record.clone()))
             .collect();
+        let observed: HashMap<String, SandboxInfo> = self
+            .client
+            .list_sandboxes()
+            .await?
+            .into_iter()
+            .map(|info| (info.sandbox_id.clone(), info))
+            .collect();
         for (sandbox_id, record) in records {
-            let info = observed.get(&record.tensorlake_id);
-            let phase = info.and_then(observed_phase);
-            match (&record.phase, phase) {
-                // Gone from Tensorlake while we delete it: finish the delete.
-                (Phase::Deleting, None) => self.forget(&sandbox_id).await,
-                (_, None) => {
-                    let detail = info.map(failure_detail).unwrap_or_default();
-                    self.set_phase(
-                        &sandbox_id,
-                        Phase::Failed {
-                            reason: "TensorlakeTerminated".into(),
-                            message: format!("Tensorlake sandbox is no longer running{detail}"),
-                        },
-                    )
-                    .await;
-                }
-                // Keep the current phase while a delete runs, while the
-                // provisioning task owns launch progress, or after a failed
-                // launch on a VM that still runs.
-                (Phase::Deleting, Some(_))
-                | (Phase::Pending | Phase::Launching, Some(Phase::Pending | Phase::Running))
-                | (Phase::Failed { .. }, Some(Phase::Running)) => {}
-                (_, Some(next)) => self.set_phase(&sandbox_id, next).await,
+            match reconcile(&record.phase, observed.get(&record.tensorlake_id)) {
+                Reconcile::Keep => {}
+                Reconcile::Forget => self.forget(&sandbox_id).await,
+                Reconcile::Set(next) => self.set_phase(&sandbox_id, next).await,
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Reconcile {
+    Keep,
+    Forget,
+    Set(Phase),
+}
+
+/// Decide how one poll observation changes a record.
+fn reconcile(current: &Phase, info: Option<&SandboxInfo>) -> Reconcile {
+    match (current, info.and_then(observed_phase)) {
+        // Gone from Tensorlake while we delete it: finish the delete.
+        (Phase::Deleting, None) => Reconcile::Forget,
+        // The provisioning task owns launch progress and reports its own
+        // failures.
+        (Phase::Pending | Phase::Launching, _)
+        // Keep the current phase while a delete runs.
+        | (Phase::Deleting, Some(_))
+        // A failed launch stays failed while the VM still exists. Nothing
+        // will launch it again.
+        | (Phase::Failed { .. }, Some(Phase::Pending | Phase::Running)) => Reconcile::Keep,
+        (_, None) => Reconcile::Set(Phase::Failed {
+            reason: "TensorlakeTerminated".into(),
+            message: format!(
+                "Tensorlake sandbox is no longer running{}",
+                info.map(failure_detail).unwrap_or_default()
+            ),
+        }),
+        (_, Some(next)) => Reconcile::Set(next),
     }
 }
 
@@ -867,9 +881,8 @@ mod tests {
         assert_eq!(failed.reason, "LaunchFailed");
     }
 
-    #[test]
-    fn observed_phase_treats_terminal_states_as_gone() {
-        let info = |status: &str| SandboxInfo {
+    fn info(status: &str) -> SandboxInfo {
+        SandboxInfo {
             sandbox_id: "x".into(),
             status: status.into(),
             name: None,
@@ -878,7 +891,54 @@ mod tests {
             termination_reason: None,
             pending_reason: None,
             error_details: None,
+        }
+    }
+
+    #[test]
+    fn reconcile_leaves_launch_to_the_provisioning_task() {
+        // A new record can be missing from a list that started before create.
+        assert_eq!(reconcile(&Phase::Pending, None), Reconcile::Keep);
+        assert_eq!(reconcile(&Phase::Launching, None), Reconcile::Keep);
+        assert_eq!(
+            reconcile(&Phase::Pending, Some(&info("running"))),
+            Reconcile::Keep
+        );
+    }
+
+    #[test]
+    fn reconcile_keeps_failed_launch_failed() {
+        let failed = Phase::Failed {
+            reason: "DriverRestarted".into(),
+            message: "m".into(),
         };
+        for status in ["pending", "running"] {
+            assert_eq!(reconcile(&failed, Some(&info(status))), Reconcile::Keep);
+        }
+    }
+
+    #[test]
+    fn reconcile_tracks_running_sandboxes() {
+        assert_eq!(reconcile(&Phase::Deleting, None), Reconcile::Forget);
+        assert_eq!(
+            reconcile(&Phase::Deleting, Some(&info("running"))),
+            Reconcile::Keep
+        );
+        assert_eq!(
+            reconcile(&Phase::Running, Some(&info("suspended"))),
+            Reconcile::Set(Phase::Suspended)
+        );
+        assert_eq!(
+            reconcile(&Phase::Suspended, Some(&info("running"))),
+            Reconcile::Set(Phase::Running)
+        );
+        assert!(matches!(
+            reconcile(&Phase::Running, Some(&info("terminated"))),
+            Reconcile::Set(Phase::Failed { reason, .. }) if reason == "TensorlakeTerminated"
+        ));
+    }
+
+    #[test]
+    fn observed_phase_treats_terminal_states_as_gone() {
         assert_eq!(observed_phase(&info("running")), Some(Phase::Running));
         assert_eq!(observed_phase(&info("suspended")), Some(Phase::Suspended));
         for status in ["terminated", "failed", "timeout"] {

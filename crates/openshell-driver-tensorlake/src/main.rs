@@ -46,7 +46,7 @@ struct Args {
     #[arg(long, env = "OPENSHELL_GRPC_ENDPOINT")]
     grpc_endpoint: String,
 
-    /// PEM CA bundle for the gateway certificate, when it uses a private CA.
+    /// PEM CA bundle that guards trust for the gateway. Required for https.
     #[arg(long, env = "OPENSHELL_TENSORLAKE_GATEWAY_TLS_CA")]
     gateway_tls_ca: Option<PathBuf>,
 
