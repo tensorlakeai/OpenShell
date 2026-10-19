@@ -356,11 +356,6 @@ impl TensorlakeComputeDriver {
                 "the Tensorlake driver does not support GPU sandboxes yet",
             ));
         }
-        if spec.launch_authentication.is_empty() {
-            return Err(Status::failed_precondition(
-                "Tensorlake sandboxes require launch-scoped gateway authentication",
-            ));
-        }
         let resources = self
             .resources_for(sandbox)
             .map_err(Status::invalid_argument)?;
@@ -371,6 +366,17 @@ impl TensorlakeComputeDriver {
 
     pub async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
         let (resources, identity) = self.validate_sandbox_create(sandbox)?;
+        // The gateway mints launch authentication after validation, so only
+        // create can require it.
+        if sandbox
+            .spec
+            .as_ref()
+            .is_none_or(|spec| spec.launch_authentication.is_empty())
+        {
+            return Err(Status::failed_precondition(
+                "Tensorlake sandboxes require launch-scoped gateway authentication",
+            ));
+        }
         if self.records.lock().await.contains_key(&sandbox.id) {
             return Err(Status::already_exists("sandbox already exists"));
         }
@@ -822,8 +828,8 @@ mod tests {
         assert_eq!(resources.memory_mb, crate::config::DEFAULT_MEMORY_MB);
     }
 
-    #[test]
-    fn validate_rejects_unsupported_requests() {
+    #[tokio::test]
+    async fn only_create_requires_launch_authentication() {
         let driver = driver();
         let mut missing_auth = sandbox(DriverSandboxTemplate::default());
         missing_auth
@@ -832,8 +838,14 @@ mod tests {
             .unwrap()
             .launch_authentication
             .clear();
-        assert!(driver.validate_sandbox_create(&missing_auth).is_err());
+        assert!(driver.validate_sandbox_create(&missing_auth).is_ok());
+        let error = driver.create_sandbox(&missing_auth).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
 
+    #[test]
+    fn validate_rejects_unsupported_requests() {
+        let driver = driver();
         let agent_socket = sandbox(DriverSandboxTemplate {
             agent_socket_path: "/run/agent.sock".into(),
             ..DriverSandboxTemplate::default()
