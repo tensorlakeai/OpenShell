@@ -99,8 +99,35 @@ pub struct StartProcessRequest {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
     pub user: String,
-    pub name: String,
     pub stdin_mode: &'static str,
+}
+
+/// Process state from the Tensorlake process API.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProcessInfo {
+    pub pid: i64,
+    /// `running`, `exited`, `signaled`, or `oom_killed`.
+    pub status: String,
+    #[serde(default)]
+    pub exit_code: Option<i64>,
+    #[serde(default)]
+    pub signal: Option<i64>,
+}
+
+impl ProcessInfo {
+    pub fn is_running(&self) -> bool {
+        self.status == "running"
+    }
+
+    /// Short summary of how the process ended, for status messages.
+    pub fn outcome(&self) -> String {
+        match (self.status.as_str(), self.exit_code, self.signal) {
+            ("exited", Some(code), _) => format!("exited with status {code}"),
+            ("signaled", _, Some(signal)) => format!("was killed by signal {signal}"),
+            ("oom_killed", _, _) => "was killed because it ran out of memory".into(),
+            (status, _, _) => format!("stopped ({status})"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -196,12 +223,29 @@ impl TensorlakeClient {
         &self,
         sandbox: &SandboxInfo,
         request: &StartProcessRequest,
-    ) -> Result<(), TensorlakeError> {
+    ) -> Result<ProcessInfo, TensorlakeError> {
         let request = self
             .proxy_request(sandbox, reqwest::Method::POST, "/api/v1/processes")?
             .json(request);
-        check(request.send().await?).await?;
-        Ok(())
+        Ok(check(request.send().await?).await?.json().await?)
+    }
+
+    /// Read one process by PID. Returns `None` when the process is unknown.
+    pub async fn get_process(
+        &self,
+        sandbox: &SandboxInfo,
+        pid: i64,
+    ) -> Result<Option<ProcessInfo>, TensorlakeError> {
+        let request = self.proxy_request(
+            sandbox,
+            reqwest::Method::GET,
+            &format!("/api/v1/processes/{pid}"),
+        )?;
+        match check(request.send().await?).await {
+            Ok(response) => Ok(Some(response.json().await?)),
+            Err(TensorlakeError::NotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn proxy_request(
@@ -302,6 +346,29 @@ mod tests {
             serde_json::to_value(&request).unwrap(),
             serde_json::json!({"image": "img", "wait": false})
         );
+    }
+
+    #[test]
+    fn start_process_request_has_no_managed_process_name() {
+        let request = StartProcessRequest {
+            command: "/bin/true".into(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            user: "root".into(),
+            stdin_mode: "closed",
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert!(value.get("name").is_none());
+    }
+
+    #[test]
+    fn process_outcome_describes_exit() {
+        let parsed: ProcessInfo = serde_json::from_value(serde_json::json!({
+            "handle": 2, "pid": 721, "status": "exited", "exit_code": 1, "signal": null
+        }))
+        .unwrap();
+        assert!(!parsed.is_running());
+        assert_eq!(parsed.outcome(), "exited with status 1");
     }
 
     #[test]

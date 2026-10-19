@@ -33,6 +33,9 @@ openshell CLI ──► gateway ──UDS──► openshell-driver-tensorlake �
    a loopback-only network namespace, and starts the guard as uid 65534.
 5. The driver reports `Ready=True` when the launcher starts. The gateway marks
    the sandbox ready when the guard session connects.
+6. Each poll checks the launcher process. If it stopped, the driver marks the
+   sandbox failed (`LauncherExited`) with its exit status. Tensorlake does
+   not restart the launcher.
 
 A poll loop reads `GET /sandboxes` because Tensorlake has no watch API.
 

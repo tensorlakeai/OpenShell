@@ -37,9 +37,6 @@ use crate::config::TensorlakeComputeConfig;
 pub const BUNDLE_UPLOAD_PATH: &str = "/var/lib/openshell/launch-bundle.tar";
 /// Launcher baked into the Tensorlake image.
 pub const LAUNCHER_PATH: &str = "/opt/openshell/bin/openshell-tensorlake-launch";
-/// Tensorlake process name for the launcher.
-pub const LAUNCHER_PROCESS_NAME: &str = "openshell-launch";
-
 /// Guard identity inside the VM. It differs from the workload identity so the
 /// workload cannot read gateway credentials.
 pub const SUPERVISOR_UID: u32 = 65_534;

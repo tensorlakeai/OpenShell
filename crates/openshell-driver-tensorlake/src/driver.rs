@@ -27,7 +27,7 @@ use tonic::Status;
 use tracing::{info, warn};
 
 use crate::client::{
-    CreateSandboxRequest, NetworkPolicy, Resources, SandboxInfo, StartProcessRequest,
+    CreateSandboxRequest, NetworkPolicy, ProcessInfo, Resources, SandboxInfo, StartProcessRequest,
     TensorlakeClient, TensorlakeError,
 };
 use crate::config::TensorlakeComputeConfig;
@@ -64,6 +64,8 @@ struct Record {
     tensorlake_name: String,
     identity: Option<ResolvedWorkloadIdentity>,
     phase: Phase,
+    /// PID of the launcher in the VM. `None` for recovered records.
+    launcher_pid: Option<i64>,
 }
 
 impl Record {
@@ -424,6 +426,7 @@ impl TensorlakeComputeDriver {
             tensorlake_name: name,
             identity: Some(identity.clone()),
             phase: Phase::Pending,
+            launcher_pid: None,
         };
         self.records
             .lock()
@@ -498,7 +501,8 @@ impl TensorlakeComputeDriver {
             .write_file(&info, launch::BUNDLE_UPLOAD_PATH, bundle)
             .await
             .map_err(|error| format!("upload launch bundle: {error}"))?;
-        self.client
+        let launcher = self
+            .client
             .start_process(
                 &info,
                 &StartProcessRequest {
@@ -506,13 +510,19 @@ impl TensorlakeComputeDriver {
                     args: vec![launch::BUNDLE_UPLOAD_PATH.to_string()],
                     env: std::collections::BTreeMap::new(),
                     user: "root".to_string(),
-                    name: launch::LAUNCHER_PROCESS_NAME.to_string(),
                     stdin_mode: "closed",
                 },
             )
             .await
             .map_err(|error| format!("start OpenShell launcher: {error}"))?;
-        info!(sandbox_id = %sandbox.id, "Started OpenShell launcher in Tensorlake sandbox");
+        info!(
+            sandbox_id = %sandbox.id,
+            launcher_pid = launcher.pid,
+            "Started OpenShell launcher in Tensorlake sandbox"
+        );
+        if let Some(record) = self.records.lock().await.get_mut(&sandbox.id) {
+            record.launcher_pid = Some(launcher.pid);
+        }
         self.set_phase(&sandbox.id, Phase::Running).await;
         Ok(())
     }
@@ -658,6 +668,7 @@ impl TensorlakeComputeDriver {
                     tensorlake_name: info.name.clone().unwrap_or_default(),
                     identity: None,
                     phase,
+                    launcher_pid: None,
                 },
             );
         }
@@ -692,13 +703,34 @@ impl TensorlakeComputeDriver {
             .map(|info| (info.sandbox_id.clone(), info))
             .collect();
         for (sandbox_id, record) in records {
-            match reconcile(&record.phase, observed.get(&record.tensorlake_id)) {
+            let info = observed.get(&record.tensorlake_id);
+            match reconcile(&record.phase, info) {
                 Reconcile::Keep => {}
                 Reconcile::Forget => self.forget(&sandbox_id).await,
                 Reconcile::Set(next) => self.set_phase(&sandbox_id, next).await,
             }
+            if let (Some(info), Some(pid)) = (info, record.launcher_pid)
+                && record.phase == Phase::Running
+                && observed_phase(info) == Some(Phase::Running)
+            {
+                self.check_launcher(&sandbox_id, info, pid).await;
+            }
         }
         Ok(())
+    }
+
+    /// Mark the sandbox failed when its launcher has stopped. Without the
+    /// launcher the guard never connects, and the gateway would wait.
+    async fn check_launcher(&self, sandbox_id: &str, info: &SandboxInfo, pid: i64) {
+        match self.client.get_process(info, pid).await {
+            Ok(process) => {
+                if let Some(failed) = launcher_failure(&info.sandbox_id, process.as_ref()) {
+                    warn!(%sandbox_id, ?failed, "OpenShell launcher stopped");
+                    self.set_phase(sandbox_id, failed).await;
+                }
+            }
+            Err(error) => warn!(%sandbox_id, %error, "Tensorlake launcher status check failed"),
+        }
     }
 }
 
@@ -731,6 +763,21 @@ fn reconcile(current: &Phase, info: Option<&SandboxInfo>) -> Reconcile {
         }),
         (_, Some(next)) => Reconcile::Set(next),
     }
+}
+
+/// The failed phase for a launcher that is no longer running.
+fn launcher_failure(tensorlake_id: &str, process: Option<&ProcessInfo>) -> Option<Phase> {
+    let outcome = match process {
+        Some(process) if process.is_running() => return None,
+        Some(process) => process.outcome(),
+        None => "is no longer known to Tensorlake".to_string(),
+    };
+    Some(Phase::Failed {
+        reason: "LauncherExited".into(),
+        message: format!(
+            "the OpenShell launcher {outcome}; run `tl sbx logs {tensorlake_id}` for details"
+        ),
+    })
 }
 
 /// Map Tensorlake status to a phase. `None` means the VM is gone.
@@ -947,6 +994,30 @@ mod tests {
             reconcile(&Phase::Running, Some(&info("terminated"))),
             Reconcile::Set(Phase::Failed { reason, .. }) if reason == "TensorlakeTerminated"
         ));
+    }
+
+    fn process(status: &str, exit_code: Option<i64>) -> ProcessInfo {
+        serde_json::from_value(serde_json::json!({
+            "pid": 721, "status": status, "exit_code": exit_code, "signal": null
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn launcher_failure_reports_stopped_launchers() {
+        assert_eq!(
+            launcher_failure("tl1", Some(&process("running", None))),
+            None
+        );
+        let Some(Phase::Failed { reason, message }) =
+            launcher_failure("tl1", Some(&process("exited", Some(1))))
+        else {
+            panic!("an exited launcher must fail the sandbox");
+        };
+        assert_eq!(reason, "LauncherExited");
+        assert!(message.contains("exited with status 1"));
+        assert!(message.contains("tl sbx logs tl1"));
+        assert!(launcher_failure("tl1", None).is_some());
     }
 
     #[test]
