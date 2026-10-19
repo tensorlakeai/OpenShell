@@ -73,7 +73,10 @@ install -d -m 0700 -o "$SUPERVISOR_UID" -g "$SUPERVISOR_GID" "$SUPERVISOR_RUN_DI
 # Workload directories. openshell-sandbox makes the workspace owned by the
 # workload identity before it drops privileges.
 install -d -m 0755 "$WORKSPACE"
-install -d -m 0700 -o "$WORKLOAD_UID" -g "$WORKLOAD_GID" /run/openshell-supervisor-ca
+# Public supervisor CA for workload TLS trust. openshell-sandbox requires the
+# parent to be traversable by every workload identity, and creates the
+# `material` child as the workload identity. It holds no secrets.
+install -d -m 0755 -o "$WORKLOAD_UID" -g "$WORKLOAD_GID" /run/openshell-supervisor-ca
 printf 'nameserver 127.0.0.53\noptions timeout:2 attempts:2\n' >"$WORKLOAD_RESOLV_CONF"
 chmod 0644 "$WORKLOAD_RESOLV_CONF"
 
