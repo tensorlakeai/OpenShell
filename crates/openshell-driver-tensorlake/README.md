@@ -57,8 +57,9 @@ Tensorlake `allow_out` is an optional second wall for the guard's own egress.
 
 ## Build the images
 
-`build-images.sh` builds two images on Tensorlake. A Tensorlake builder
-sandbox runs each build, so local Docker is not needed.
+`build-images.sh` builds two CAS images on Tensorlake (`--cas`). Tensorlake
+runs each build, so local Docker is not needed. CAS images start fast and
+run on the Tensorlake CAS dataplane.
 
 | Image | Default name | Contents |
 |---|---|---|
@@ -127,12 +128,16 @@ openshell-gateway --compute-driver tensorlake \
 | `--tensorlake-api-key` | `TENSORLAKE_API_KEY` | required |
 | `--sandbox-image` | `OPENSHELL_SANDBOX_IMAGE` | required |
 | `--cpus` / `--memory-mb` / `--disk-mb` | `OPENSHELL_TENSORLAKE_*` | 2 / 4096 / Tensorlake default |
-| `--timeout-secs` | `OPENSHELL_TENSORLAKE_TIMEOUT_SECS` | Tensorlake default |
+| `--timeout-secs` | `OPENSHELL_TENSORLAKE_TIMEOUT_SECS` | 0 (plan maximum) |
 | `--allow-out` | `OPENSHELL_TENSORLAKE_ALLOW_OUT` | empty (internet on) |
 | `--poll-interval-secs` | `OPENSHELL_TENSORLAKE_POLL_INTERVAL_SECS` | 3 |
 
 The guard trusts only the `--gateway-tls-ca` bundle, not public roots. For a
 gateway with a public certificate, pass the root CA that signed it.
+
+The Tensorlake timeout counts idle time, and only incoming traffic resets
+it. Guard traffic to the gateway is outgoing, so a short timeout suspends a
+working sandbox. Keep the default `0`, which uses the plan maximum.
 
 When `--allow-out` is set, the driver turns off Tensorlake internet access and
 adds the gateway host to the list.
@@ -218,4 +223,8 @@ end-to-end run on Tensorlake still needs to confirm that:
 - the file API writes as root, and the process API runs the launcher as root;
 - the guard can reach the gateway over a long-lived gRPC connection;
 - the port proxy sends gRPC to a plaintext HTTP/2 backend, and keeps
-  long-lived streams open.
+  long-lived streams open;
+- CAS builds accept the multi-stage Dockerfiles and `--public`;
+- the CAS dataplane enables Landlock, seccomp, and `unshare --net`, and
+  supports the file and process APIs, exposed ports, and long-lived managed
+  processes.
