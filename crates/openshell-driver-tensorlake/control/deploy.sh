@@ -28,7 +28,6 @@ set -euo pipefail
 NAME="${CONTROL_NAME:-openshell-control}"
 IMAGE="${CONTROL_IMAGE:-openshell-control}"
 PORT=8080
-PUBLIC_URL="https://${PORT}-${NAME}.sandbox.tensorlake.ai"
 PROCESS=openshell-control
 REMOTE_ENV=/etc/openshell-control/control.env
 
@@ -46,7 +45,12 @@ else
         --timeout "${CONTROL_TIMEOUT_SECS:-0}"
 fi
 
-# Guards in other sandboxes dial this port without a Tensorlake key.
+# Guards in other sandboxes dial this port without a Tensorlake key. The
+# proxy resolves sandbox names only for authenticated requests, so guards
+# must use the sandbox ID.
+SANDBOX_ID="$(tl sbx describe "${NAME}" | awk '/^ID:/ {print $2}')"
+[ -n "${SANDBOX_ID}" ] || { echo "error: cannot read the ID of sandbox ${NAME}" >&2; exit 1; }
+PUBLIC_URL="https://${PORT}-${SANDBOX_ID}.sandbox.tensorlake.ai"
 echo "==> Exposing port ${PORT}"
 tl sbx port expose "${NAME}" "${PORT}"
 

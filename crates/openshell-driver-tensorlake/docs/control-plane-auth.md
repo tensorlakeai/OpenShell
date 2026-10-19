@@ -9,7 +9,7 @@ The control plane (gateway and driver) runs in a Tensorlake sandbox. Guards
 in other sandboxes reach the gateway through the Tensorlake port proxy:
 
 ```
-https://8080-<name>.sandbox.tensorlake.ai
+https://8080-<sandbox-id>.sandbox.tensorlake.ai
 ```
 
 Guards cannot hold a Tensorlake key, so this port must accept anonymous

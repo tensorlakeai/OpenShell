@@ -158,7 +158,7 @@ Tensorlake sandbox.
                                │    ▲ UDS                          │
                                │  driver ──► Tensorlake API        │
                                └────▲──────────────────────────────┘
-                                    │ https://8080-<name>.sandbox.tensorlake.ai
+                                    │ https://8080-<sandbox-id>.sandbox.tensorlake.ai
                                guards in sandbox VMs (public port, TLS at proxy)
 ```
 
@@ -185,7 +185,7 @@ of the control image for that certificate.
 3. Connect the CLI. With OIDC, use the public URL:
 
    ```shell
-   openshell gateway add https://8080-openshell-control.sandbox.tensorlake.ai \
+   openshell gateway add https://8080-<sandbox-id>.sandbox.tensorlake.ai \
      --oidc-issuer https://issuer.example.com
    ```
 
@@ -197,7 +197,8 @@ of the control image for that certificate.
    ```
 
 Guards cannot hold a Tensorlake key, so port 8080 accepts anonymous
-requests. The gateway must authenticate users itself. The start script
+requests. The port proxy resolves sandbox names only for authenticated
+requests, so the guards' URL uses the sandbox ID (`deploy.sh` prints it). The gateway must authenticate users itself. The start script
 refuses to run without `OPENSHELL_OIDC_ISSUER`, unless you set
 `OPENSHELL_CONTROL_ALLOW_UNAUTHENTICATED=1`. With that setting, anyone with
 the URL controls the gateway. Use it only for a short test with
