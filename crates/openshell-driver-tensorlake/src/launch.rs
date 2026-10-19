@@ -21,9 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use openshell_core::proto::compute::v1::DriverSandbox;
-use openshell_isolation_interface::contract::{
-    OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
-};
+use openshell_isolation_interface::contract::{ProvisioningEvidence, ResolvedWorkloadIdentity};
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
@@ -111,6 +109,10 @@ pub fn resolve_identity(
 
 /// Evidence for the outer fence that the launcher builds. The driver cannot
 /// inspect the VM, so the evidence names the launch recipe it requested.
+///
+/// A loopback-only network namespace has no route out. Egress needs a
+/// mediated decision, revocation takes effect at the guard, and guard loss
+/// leaves the namespace without a path.
 #[derive(Serialize)]
 struct TensorlakeOuterFenceEvidence<'a> {
     tensorlake_sandbox_id: &'a str,
@@ -118,29 +120,22 @@ struct TensorlakeOuterFenceEvidence<'a> {
     launcher: &'static str,
 }
 
-fn outer_fence(
+/// Bind the launch recipe to one generation as provisioning evidence.
+fn provisioning_evidence(
     tensorlake_sandbox_id: &str,
     generation: &str,
-) -> Result<OuterFenceGuarantees, String> {
+) -> Result<ProvisioningEvidence, String> {
+    if tensorlake_sandbox_id.is_empty() {
+        return Err("Tensorlake sandbox ID is required for provisioning evidence".to_string());
+    }
     let evidence = TensorlakeOuterFenceEvidence {
         tensorlake_sandbox_id,
         workload_network_namespace: "private-loopback-only",
         launcher: LAUNCHER_PATH,
     };
-    // A loopback-only network namespace has no route out. Egress needs a
-    // mediated decision, revocation takes effect at the guard, and guard loss
-    // leaves the namespace without a path.
-    let projection = OuterFenceGuarantees::from_enforcement_evidence(
-        generation,
-        [
-            OuterFenceGuarantee::DefaultDenyEgress,
-            OuterFenceGuarantee::NoUnmanagedEgressPath,
-            OuterFenceGuarantee::RevocationVerified,
-            OuterFenceGuarantee::ControllerLossFailsClosed,
-        ],
-        &serde_json::to_vec(&evidence).map_err(invalid)?,
-    )
-    .map_err(invalid)?;
+    let encoded = serde_json::to_vec(&evidence).map_err(invalid)?;
+    let projection =
+        ProvisioningEvidence::from_enforcement_evidence(generation, &encoded).map_err(invalid)?;
     projection.validate(generation).map_err(invalid)?;
     Ok(projection)
 }
@@ -298,7 +293,7 @@ pub fn build_launch_bundle(input: LaunchBundleInput<'_>) -> Result<Vec<u8>, Stri
         .runtime_generation
         .to_string();
     let tls = generate_sandbox_tls_material(session_id).map_err(invalid)?;
-    let outer_fence = outer_fence(tensorlake_sandbox_id, &generation)?;
+    let provisioning_evidence = provisioning_evidence(tensorlake_sandbox_id, &generation)?;
     let resource_claims = BTreeMap::from([
         (
             "tensorlake.sandbox_id".to_string(),
@@ -340,7 +335,7 @@ pub fn build_launch_bundle(input: LaunchBundleInput<'_>) -> Result<Vec<u8>, Stri
         resource_claims: resource_claims.clone(),
         resource_claim_files: BTreeMap::new(),
         workload_identity: identity.clone(),
-        outer_fence: outer_fence.clone(),
+        provisioning_evidence: provisioning_evidence.clone(),
         child_env: child_environment(sandbox),
     };
     let runtime_descriptor = SandboxRuntimeDescriptor {
@@ -357,7 +352,7 @@ pub fn build_launch_bundle(input: LaunchBundleInput<'_>) -> Result<Vec<u8>, Stri
         host_gateway_ip: None,
         resource_claims,
         workload_identity: identity.clone(),
-        outer_fence,
+        provisioning_evidence,
     };
 
     let workload = Owner::new(identity.uid, identity.gid);
@@ -542,9 +537,14 @@ mod tests {
     }
 
     #[test]
-    fn outer_fence_is_complete() {
-        let fence = outer_fence("tl-1", "gen-1").unwrap();
-        assert!(fence.validate("gen-1").is_ok());
+    fn provisioning_evidence_binds_generation() {
+        let evidence = provisioning_evidence("tl-1", "gen-1").unwrap();
+        assert!(evidence.validate("gen-1").is_ok());
+        assert!(evidence.validate("gen-2").is_err());
+        let other = provisioning_evidence("tl-2", "gen-1").unwrap();
+        assert_ne!(evidence.evidence_digest, other.evidence_digest);
+        assert!(provisioning_evidence("", "gen-1").is_err());
+        assert!(provisioning_evidence("tl-1", "").is_err());
     }
 
     #[test]

@@ -12,7 +12,7 @@
 # expand variables in FROM, so the image tags are fixed here. Pin the
 # upstream commit this branch is based on, the same as image/Dockerfile.
 
-FROM ghcr.io/nvidia/openshell/gateway:a4c848adbddd0b4732fd70ddcf8a563a5b1e9317 AS gateway
+FROM ghcr.io/nvidia/openshell/gateway:1cb9ef8ab469354a641893f8e26957e988f5c7ef AS gateway
 
 FROM rust:1.95-trixie AS driver
 WORKDIR /src

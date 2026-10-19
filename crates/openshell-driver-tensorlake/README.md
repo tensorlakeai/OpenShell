@@ -53,8 +53,9 @@ The workload identity cannot read the guard's files. Root in the VM can.
 
 The launcher runs the workload in a new network namespace that has only
 loopback, so the workload has no network path except the boundary channel.
-The driver reports all four outer-fence guarantees based on this launch
-recipe. It cannot inspect the VM to confirm them.
+The driver binds this launch recipe to the sandbox generation as the
+provisioning evidence in the boundary config and runtime descriptor. It
+cannot inspect the VM to confirm the recipe.
 
 Tensorlake `allow_out` is an optional second wall for the guard's own egress.
 
