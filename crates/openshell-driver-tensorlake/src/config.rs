@@ -35,7 +35,8 @@ pub struct TensorlakeComputeConfig {
     pub default_cpus: f64,
     pub default_memory_mb: i64,
     pub default_disk_mb: Option<u64>,
-    /// Tensorlake sandbox timeout. `None` uses the Tensorlake default.
+    /// Tensorlake idle timeout. `Some(0)` uses the plan maximum. `None` uses
+    /// the Tensorlake default (600 seconds).
     pub timeout_secs: Option<i64>,
     /// Tensorlake `allow_out` entries. Empty keeps Tensorlake's default
     /// internet access and relies on the `OpenShell` guard alone.

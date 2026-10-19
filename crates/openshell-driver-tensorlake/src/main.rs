@@ -69,9 +69,11 @@ struct Args {
     #[arg(long, env = "OPENSHELL_TENSORLAKE_DISK_MB")]
     disk_mb: Option<u64>,
 
-    /// Tensorlake sandbox timeout in seconds.
-    #[arg(long, env = "OPENSHELL_TENSORLAKE_TIMEOUT_SECS")]
-    timeout_secs: Option<i64>,
+    /// Tensorlake idle timeout in seconds. 0 uses the plan maximum. Guard
+    /// traffic to the gateway is outbound, so Tensorlake counts a working
+    /// sandbox as idle; a short timeout suspends it.
+    #[arg(long, env = "OPENSHELL_TENSORLAKE_TIMEOUT_SECS", default_value_t = 0)]
+    timeout_secs: i64,
 
     /// Tensorlake `allow_out` entry (repeatable, or comma-separated in the
     /// environment). The gateway host is added automatically. Empty keeps
@@ -109,7 +111,7 @@ async fn main() -> Result<()> {
         default_cpus: args.cpus,
         default_memory_mb: args.memory_mb,
         default_disk_mb: args.disk_mb,
-        timeout_secs: args.timeout_secs,
+        timeout_secs: Some(args.timeout_secs),
         allow_out: args
             .allow_out
             .into_iter()

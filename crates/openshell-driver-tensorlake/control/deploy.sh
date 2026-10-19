@@ -13,6 +13,7 @@
 # Optional:
 #   CONTROL_NAME                  sandbox name (default: openshell-control)
 #   CONTROL_IMAGE                 registered control-plane image (default: openshell-control)
+#   CONTROL_TIMEOUT_SECS          Tensorlake idle timeout (default: 0, the plan maximum)
 #   OPENSHELL_SANDBOX_IMAGE       sandbox image (default: the one built with CONTROL_IMAGE)
 #   OPENSHELL_OIDC_ISSUER, OPENSHELL_OIDC_AUDIENCE, ...
 #                                 gateway OIDC settings for user authentication
@@ -35,11 +36,14 @@ REMOTE_ENV=/etc/openshell-control/control.env
 command -v tl >/dev/null || { echo "error: the tl CLI is not installed" >&2; exit 1; }
 
 if tl sbx describe "${NAME}" >/dev/null 2>&1; then
-    echo "==> Using existing sandbox ${NAME}"
+    echo "==> Using existing sandbox ${NAME}. To use a new image, terminate it first."
     tl sbx kill "${NAME}" "${PROCESS}" >/dev/null 2>&1 || true
 else
     echo "==> Creating sandbox ${NAME} from image ${IMAGE}"
-    tl sbx create "${NAME}" --image "${IMAGE}" --cpus 2 --memory 4096
+    # The timeout counts idle time. 0 uses the plan maximum, so the control
+    # plane is not suspended while no user is connected.
+    tl sbx create "${NAME}" --image "${IMAGE}" --cpus 2 --memory 4096 \
+        --timeout "${CONTROL_TIMEOUT_SECS:-0}"
 fi
 
 # Guards in other sandboxes dial this port without a Tensorlake key.
