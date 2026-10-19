@@ -8,12 +8,29 @@
 //! `X-Tensorlake-Sandbox-Id` routing header.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 const SANDBOX_ID_HEADER: &str = "X-Tensorlake-Sandbox-Id";
 const ROUTE_HINT_HEADER: &str = "X-Tensorlake-Route-Hint";
+/// The Tensorlake SDK sends the client deadline in milliseconds on every
+/// request so the server can stop work at the same point.
+const REQUEST_TIMEOUT_HEADER: &str = "X-Tensorlake-Request-Timeout-Ms";
+
+/// Upper bound on opening a TCP connection to the API or a sandbox proxy.
+/// The Tensorlake SDK sets none; this matches the `OpenShell` SDK transport.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound on one whole request, from send to the last response byte.
+///
+/// This is the Tensorlake SDK default (`DEFAULT_HTTP_TIMEOUT_SEC`), sized for
+/// a blocking create that waits for the server's ready timeout. The driver
+/// creates with `wait: false` and uploads only a small configuration tar, so
+/// every call should finish well inside it. The bound exists because the
+/// status poll awaits launcher checks one sandbox at a time: one stalled
+/// connection must fail instead of freezing reconciliation for every sandbox.
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum TensorlakeError {
@@ -139,12 +156,26 @@ pub struct TensorlakeClient {
 
 impl TensorlakeClient {
     pub fn new(api_url: &str, api_key: &str) -> Result<Self, TensorlakeError> {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // Reqwest uses Rustls's process-default provider. Ensure one exists
+        // through the crypto facade instead of hard-coding a backend here.
+        // Classification: like the other Reqwest clients listed in
+        // `openshell-crypto/README.md`, this transport does not necessarily
+        // honor an explicitly selected `CryptoContext`.
+        openshell_crypto::tls::ensure_default_provider();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            REQUEST_TIMEOUT_HEADER,
+            reqwest::header::HeaderValue::from_str(&REQUEST_TIMEOUT.as_millis().to_string())
+                .expect("a decimal millisecond count is a valid header value"),
+        );
         let http = reqwest::Client::builder()
             .user_agent(format!(
                 "openshell-driver-tensorlake/{}",
                 openshell_core::VERSION
             ))
+            .default_headers(headers)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()?;
         Ok(Self {
             http,
