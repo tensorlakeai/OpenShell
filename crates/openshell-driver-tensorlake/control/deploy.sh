@@ -14,6 +14,8 @@
 #   CONTROL_NAME                  sandbox name (default: openshell-control)
 #   CONTROL_IMAGE                 registered control-plane image (default: openshell-control)
 #   CONTROL_TIMEOUT_SECS          Tensorlake idle timeout (default: 0, the plan maximum)
+#   RECREATE=1                    terminate an existing control sandbox first, so a
+#                                 new CONTROL_IMAGE takes effect (discards gateway state)
 #   OPENSHELL_SANDBOX_IMAGE       sandbox image (default: the one built with CONTROL_IMAGE)
 #   OPENSHELL_OIDC_ISSUER, OPENSHELL_OIDC_AUDIENCE, ...
 #                                 gateway OIDC settings for user authentication
@@ -34,8 +36,12 @@ REMOTE_ENV=/etc/openshell-control/control.env
 [ -n "${TENSORLAKE_API_KEY:-}" ] || { echo "error: set TENSORLAKE_API_KEY" >&2; exit 1; }
 command -v tl >/dev/null || { echo "error: the tl CLI is not installed" >&2; exit 1; }
 
+if [ "${RECREATE:-}" = "1" ] && tl sbx describe "${NAME}" >/dev/null 2>&1; then
+    echo "==> Terminating existing sandbox ${NAME}"
+    tl sbx terminate "${NAME}"
+fi
 if tl sbx describe "${NAME}" >/dev/null 2>&1; then
-    echo "==> Using existing sandbox ${NAME}. To use a new image, terminate it first."
+    echo "==> Using existing sandbox ${NAME}. Set RECREATE=1 to use a new image."
     tl sbx kill "${NAME}" "${PROCESS}" >/dev/null 2>&1 || true
 else
     echo "==> Creating sandbox ${NAME} from image ${IMAGE}"

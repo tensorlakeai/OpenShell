@@ -84,6 +84,34 @@ directory as the context, and does not expand variables in `FROM`. So both
 Dockerfiles pin the upstream OpenShell images to the upstream commit that
 this branch is based on. Change the pin when you rebase.
 
+Keep one pair of image names for development, for example
+`openshell-tensorlake-test` and `openshell-control-test`. A build under an
+existing name replaces that image, and new sandboxes use the new content.
+Tensorlake cannot delete CAS images yet, so every new name stays in the
+project forever.
+
+### Rebuild loop
+
+For a change to the launcher or `image/Dockerfile`, rebuild only the sandbox
+image. The driver resolves the image name on every sandbox create, so the
+control plane needs no restart:
+
+```shell
+tl sbx image create crates/openshell-driver-tensorlake/image/Dockerfile \
+  --registered-name openshell-tensorlake-test --cas
+```
+
+For a change to the driver, rebuild both images and recreate the control
+sandbox. Recreating discards gateway state and changes the sandbox ID, so
+add the gateway to the CLI again afterwards:
+
+```shell
+SANDBOX_IMAGE=openshell-tensorlake-test CONTROL_IMAGE=openshell-control-test \
+  crates/openshell-driver-tensorlake/build-images.sh
+RECREATE=1 CONTROL_IMAGE=openshell-control-test \
+  crates/openshell-driver-tensorlake/control/deploy.sh
+```
+
 The sandbox image must not contain `/.openshell`. Derive from it to add agent
 tools.
 
