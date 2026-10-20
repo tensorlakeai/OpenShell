@@ -1,156 +1,213 @@
-# Split topology: the guard outside the workload VM
+# Split topology: the guard in its own VM
 
-Status: design. Not implemented. It needs one Tensorlake capability that is
-not confirmed yet, listed under [What Tensorlake must provide](#what-tensorlake-must-provide).
+Status: implemented as the default topology (`--topology split`) and
+verified end to end on Tensorlake Cloud on 2026-10-20, including policy
+enforcement with binary identity. The combined topology
+(`--topology combined`) stays for tests and for accounts that cannot afford
+two VMs per sandbox.
 
 ## Problem
 
-Today the guard (`openshell-supervisor`) and the workload (`openshell-sandbox`)
-share one Tensorlake VM. The guard holds the gateway session token and the
-provider credentials. A root user in that VM can read them, and anyone with
-access to the Tensorlake project can become root with `tl sbx exec --user
-root`. So the driver is safe for test credentials only.
+In the combined topology the guard (`openshell-supervisor`) and the workload
+(`openshell-sandbox`) share one Tensorlake VM. The guard holds the gateway
+session token and the provider credentials. The workload cannot read them in
+normal operation: it runs as a different user, with `no_new_privs`, in a
+network namespace that has only loopback. But one kernel exploit in that VM
+gives the agent everything. That is container-grade separation. The VM
+driver (`openshell-driver-vm`) gives hypervisor-grade separation, because its
+guard runs outside the guest. This document describes how the Tensorlake
+driver gets the same property.
 
-The VM driver (`openshell-driver-vm`) does not have this gap. Its guard runs
-on the gateway host and reaches the guest over a vsock channel. Credentials
-never enter the VM. This document describes how to get the same property on
-Tensorlake.
+## Design
+
+Two Tensorlake sandboxes per OpenShell sandbox:
+
+| Tensorlake sandbox | Runs | Network | Holds |
+|---|---|---|---|
+| `openshell-<id>` (workload VM) | `openshell-sandbox` and the agent in a private network namespace, plus a tunnel forwarder | Internet off, empty allow list. No outbound path at all. | Its own channel key. No gateway or provider secret. |
+| `openshell-<id>-guard` (guard VM) | `openshell-supervisor` and a `tl` tunnel | Default internet, or `--allow-out` plus the gateway and Tensorlake hosts | Gateway token, provider credentials, a Tensorlake API key for the tunnel |
+
+```
+ control sandbox          guard VM (trusted)                 workload VM (untrusted)
+┌───────────────┐  HTTPS ┌──────────────────────────┐        ┌──────────────────────────────────────┐
+│ gateway ◄─────┼────────┼─ openshell-supervisor    │        │ 127.0.0.1:8443 socat forwarder       │
+│ driver ─► API │        │    │ OpenShell TLS        │ WSS to │    │ veth 169.254.77.1 -> .2:8444    │
+└───────────────┘        │    ▼                     │ proxy  │ ┌──▼── netns openshell-workload ────┐│
+                         │ 127.0.0.1:18443 tunnel ──┼───────►│ │ openshell-sandbox :8444 TLS       ││
+                         └──────────────────────────┘        │ │   └─► agent processes (lo only)   ││
+                                                             │ └───────────────────────────────────┘│
+                                                             └──────────────────────────────────────┘
+```
+
+The guard dials `127.0.0.1:18443` in its own VM. The `tl sbx tunnel` process
+there carries the bytes to the Tensorlake sandbox proxy over a WebSocket,
+and the proxy delivers them to `127.0.0.1:8443` in the workload VM. A
+`socat` forwarder accepts them there and connects into the workload's
+network namespace over a veth link, from `169.254.77.1` to the runtime at
+`169.254.77.2:8444`. The tunnel and the forwarder do not inspect the bytes.
+OpenShell's own TLS handshake runs end to end between guard and workload,
+with the per-generation certificate the driver issued.
+
+The forwarder exists because the sandbox runtime rejects boundary peers
+that are loopback or share its own address (`reject_workload_tcp_peer` in
+`openshell-sandbox`), and the Tensorlake tunnel always delivers to loopback.
+Measured: the runtime reset every tunnel connection until the forwarder
+gave it a veth peer. The namespace also keeps the workload's loopback as
+empty as in the combined topology, so the workload cannot reach the VM's
+own SSH daemon or the forwarder.
+
+This is the same shape as the Kubernetes driver: one guard pod per workload
+pod, a TLS listener in the workload, a NetworkPolicy that gives the workload
+no egress. Tensorlake's network policy is the outer fence here.
 
 ## What the protocol already supports
 
-The sandbox protocol between the guard and the workload is TLS with keys that
-the driver creates for each sandbox generation. It does not depend on a Unix
-socket. The shared types in `openshell-sandbox-backend` and `openshell-core`
-offer three transports:
+The sandbox protocol does not depend on a Unix socket. The shared types in
+`openshell-sandbox-backend` and `openshell-core` offer three transports:
 
-| Side | Type | Variants |
+| Side | Type | Used here |
 |---|---|---|
-| Workload listens | `BoundaryListener` | `Unix`, `TlsTcp { address }`, `Vsock` |
-| Guard connects | `SandboxTransport` | `Unix`, `Tcp { authority, addresses }`, `Vsock` |
+| Workload listens | `BoundaryListener::TlsTcp { address }` | `0.0.0.0:8444` inside the workload namespace |
+| Guard connects | `SandboxTransport::Tcp { authority, addresses }` | authority `<workload-id>:8443`, address `127.0.0.1:18443` |
 
-The VM driver uses `Vsock`. The Tensorlake driver uses `Unix` today. The
-split topology uses `TlsTcp` on the workload side and `Tcp` on the guard side.
-`Tcp.addresses` must be concrete `IP:port` pairs; a hostname is not accepted.
-No change to `openshell-supervisor` or `openshell-sandbox` is needed.
+The listener must not bind a loopback address, because workload sockets
+share loopback, so it binds `0.0.0.0`. The sandbox runtime then protects the
+listener port from workload connections itself, and rejects loopback peers
+in `accept`, which is why the forwarder connects from a veth address.
+`Tcp.addresses` must be concrete `IP:port` pairs, which `127.0.0.1:18443`
+is. No change to `openshell-supervisor` or `openshell-sandbox` was needed.
 
-## Two placements
+## Why the tunnel and not a sandbox IP
 
-Both placements move the guard out of the workload VM. They differ in how
-many guard processes share one VM.
+The Tensorlake HTTPS port proxy terminates TLS and presents its own
+certificate, so it cannot carry the OpenShell channel. Tensorlake has no
+private sandbox-to-sandbox network and no sandbox IP in the API. The tunnel
+is the one path that relays raw TCP between two sandboxes today. Measured on
+Tensorlake Cloud on 2026-10-20:
 
-### A. Guard in the control sandbox (recommended first)
+| Check | Result |
+|---|---|
+| Tunnel into a sandbox with internet off | Works. The fence can be fully closed. |
+| Target port not in `exposed_ports` | Works. The port is never public. |
+| Address the tunnel dials inside the target | `127.0.0.1:<port>` only, not the `eth0` address |
+| 100 tunnels from one sandbox | All alive, ~50 ms to open each |
+| 500 concurrent connections through one tunnel | All held and answering |
+| Throughput through one tunnel | ~300 MiB/s each direction |
+| Idle tunnel | Still relaying after 13 minutes |
+| `tl sbx tunnel` process | 15 MiB RSS |
 
-The control sandbox already runs the gateway and the driver. It holds the
-Tensorlake key, so it is already the trusted component. Run one
-`openshell-supervisor` process per sandbox inside it, the same way the VM
-driver runs one supervisor per sandbox on the gateway host.
+If Tensorlake adds private networking with a sandbox IP later, the driver
+can put that IP into `Tcp.addresses` and drop the tunnel. Nothing else
+changes.
 
-```
- control sandbox (trusted)                      workload sandbox (untrusted)
-┌─────────────────────────────────┐             ┌──────────────────────────┐
-│ gateway ◄── loopback ── guard ──┼── TLS/TCP ──► openshell-sandbox        │
-│ driver ──► Tensorlake API       │             │   └─► agent processes    │
-└─────────────────────────────────┘             └──────────────────────────┘
-```
+## What the driver does
 
-- The guard dials the gateway on loopback. The public gateway URL is still
-  needed for users, but not for guards. The idle-timeout problem in the README
-  goes away for the workload VM, because the guard's connection to it is
-  incoming traffic.
-- The workload VM gets a Tensorlake network policy with
-  `allow_internet_access: false` and an empty `allow_out`. It needs no
-  egress at all: the workload's connections travel over the boundary channel
-  to the guard, which applies policy and connects upstream. This network
-  policy is the outer fence, and the driver can record it as fence evidence
-  from the API response rather than from a launch recipe it cannot inspect.
-- One image: the sandbox image keeps only `openshell-sandbox` and a smaller
-  launch script. The control image already has the gateway and the driver and
-  gains `openshell-supervisor`.
-- The driver spawns and reaps the supervisor processes. The VM driver's
-  `spawn_host_supervisor` in `crates/openshell-driver-vm/src/driver.rs` is the
-  model: an environment and argument list, a run directory per sandbox, and a
-  wait on the child.
+1. **Create.** Two Tensorlake create calls: the workload VM from the sandbox
+   image with `allow_internet_access: false` and an empty `allow_out`, and
+   the guard VM from the guard image with the operator's `--allow-out` plus
+   the gateway host and the Tensorlake API host. Create returns after both
+   are accepted.
+2. **Wait.** A background task polls both VMs until they report `running`.
+3. **Workload bundle.** Uploaded to the workload VM: the boundary bootstrap
+   with the `TlsTcp` listener, the channel server certificate and key, and
+   the launch parameters with `ROLE=workload`. The launcher creates the
+   `openshell-workload` network namespace with loopback and a veth link,
+   starts `openshell-sandbox launch-capability-free` inside it with a
+   resolver file that points at the runtime's DNS relay, and starts the
+   `socat` forwarder as user 65533 in the VM's own namespace.
+4. **Guard bundle.** Uploaded to the guard VM: the runtime descriptor with
+   the `Tcp` transport, the auth bundle, sandbox token, gateway CA, the
+   guard's environment and arguments, and a tunnel file with the Tensorlake
+   API key and the workload VM's ID. `ROLE=guard`. The launcher starts the
+   tunnel as user 65533 and the guard as user 65534. Neither can read the
+   other's files. The launcher exits when either process exits.
+5. **Run.** The driver reports Running when both launchers started. The
+   gateway marks the sandbox ready when the guard connects. The guard's
+   first connection to the workload retries until the workload listener is
+   up, so start order does not matter.
+6. **Poll.** Every few seconds the driver lists Tensorlake sandboxes. If
+   either VM is gone, the sandbox is failed. Both launchers are checked;
+   an exit is reported as `LauncherExited` with the VM to look at.
+7. **Delete.** Both VMs are deleted. The record is forgotten when both are
+   gone.
+8. **Recover.** After a driver restart, VMs are paired by name:
+   `openshell-<id>` and `openshell-<id>-guard`. A pair with one half missing
+   is reported as failed.
 
-The cost is that the control sandbox concentrates privilege. It does today
-already. Keep it in its own Tensorlake project.
+### Fence evidence
 
-### B. One guard VM per sandbox
+The driver writes the outer fence into the provisioning evidence that the
+guard confirms with the workload: the recipe for the workload VM (a private network namespace whose only
+link leads to the forwarder, in a VM with `allow_internet_access: false`
+and an empty allow list) and the IDs of both VMs. The driver cannot inspect the VM, and Tensorlake does
+not return the applied policy in `SandboxInfo`, so this is the requested
+recipe, as in the combined topology.
 
-Create two Tensorlake sandboxes per OpenShell sandbox: `openshell-<id>` for
-the workload and `openshell-<id>-guard` for the guard. The guard VM runs from a
-small guard image and dials the gateway over the public URL as today.
+## Trust model
 
-This keeps the control sandbox small and gives each guard its own kernel. It
-doubles the VM count and the boot time, needs a second image, and needs
-pairwise recovery after a driver restart. Do it only if placement A proves
-too concentrated.
+| Attacker | Combined | Split |
+|---|---|---|
+| Agent with a local kernel exploit | Reads gateway token and credentials | Gets root in a VM that holds only its own channel key. Credentials are in another VM. Egress is still blocked by the Tensorlake fence and still mediated by the guard. |
+| Tensorlake project member with `tl sbx exec --user root` | Reads everything in the one VM | Reads everything in the guard VM. Same as today. |
+| Anyone with the guard VM's API key | n/a | Can open tunnels to any sandbox in that project. |
 
-## Driver changes for placement A
+The new exposure is the API key in each guard VM. Two mitigations:
 
-1. **Launch bundle.** Split `launch::build_launch_bundle` into a workload
-   bundle (bootstrap, server certificate and key, launch parameters) and a
-   guard bundle (runtime descriptor, auth bundle, sandbox token, gateway CA).
-   Only the workload bundle is uploaded. The guard bundle is written to a
-   private directory in the control sandbox, mode 0700, owned by the driver
-   user.
-2. **Listener.** The bootstrap's `BoundaryListener` becomes
-   `TlsTcp { address: 0.0.0.0:<port> }`. The launch script no longer creates a
-   network namespace. It starts `openshell-sandbox launch-capability-free`
-   directly.
-3. **Transport.** The runtime descriptor's `SandboxTransport` becomes
-   `Tcp { authority: "openshell-<id>", addresses: [<workload-ip>:<port>] }`.
-   The driver must know the workload VM's address when the VM reports
-   `running`. See the next section.
-4. **Supervisor process.** After the launcher starts, the driver spawns
-   `openshell-supervisor` in the control sandbox with the guard bundle. It
-   records the child in the sandbox `Record` and treats child exit the same as
-   `LauncherExited` today.
-5. **Network policy.** `CreateSandboxRequest.network` is always set for the
-   workload VM: `allow_internet_access: false`, `allow_out: []`. The
-   `--allow-out` flag then applies to the control sandbox, not to workload
-   VMs, and can be removed from the driver.
-6. **Fence evidence.** Replace `TensorlakeOuterFenceEvidence.workload_network_namespace`
-   with the applied Tensorlake network policy.
-7. **Recovery.** On restart, the driver finds workload VMs by name as today,
-   and restarts a supervisor for each one from the saved guard bundle. Guard
-   bundles therefore must survive a driver restart, which they do in the
-   control sandbox's `/var/lib/openshell`.
-8. **Control image.** Add `openshell-supervisor` from the published
-   supervisor image and `ca-certificates` for upstream TLS.
+- Run the control plane and its sandboxes in a dedicated Tensorlake project,
+  so a leaked guard key reaches nothing else. This is already the README's
+  advice.
+- Tensorlake could issue keys scoped to one target sandbox for tunnels. That
+  is the clean fix and needs platform work.
 
-Steps 1 to 3 are pure Rust changes with unit tests. Steps 4 to 8 need a
-Tensorlake account to test end to end.
+## Cost
 
-## What Tensorlake must provide
+Two VMs per sandbox. The guard VM defaults to 1 vCPU and 1 GiB; the guard
+uses about 32 MiB and the tunnel 15 MiB. Two VMs boot in parallel, so create
+to ready stays a few seconds. All workload egress flows guard VM to proxy to
+workload VM. The tunnel measured about 300 MiB/s, far above what an agent
+needs, but each guard VM also pays the CPU for TLS and policy on that
+traffic. Size `--guard-cpus` up for agents that move bulk data.
 
-The guard must open a raw TCP connection to the workload VM and complete a
-TLS handshake with the workload's own certificate. The Tensorlake port proxy
-cannot carry this channel, because it terminates TLS and presents its own
-certificate.
+## Alternative kept out: guards in the control sandbox
 
-The driver needs one of:
+Running every guard inside the control sandbox saves the guard VMs. It also
+puts every credential of the project in one kernel, shares 2 vCPUs across
+all guards, and drops every session when the control sandbox restarts.
+Measured: a 4 GiB control sandbox would fit about 50 guards with `tl`
+helper processes or about 100 with the tunnel linked in. The per-sandbox
+guard VM was chosen instead because the security property is the point of
+this work, and because it matches the Kubernetes driver and the customer
+request that motivated it.
 
-- **Private sandbox-to-sandbox networking.** Sandboxes in one project can
-  reach each other on a private IP, and the API returns that IP in the
-  sandbox description. This is the clean answer. `SandboxInfo` today exposes
-  `sandbox_url` and `routing_hint` only.
-- **A raw TCP port forward.** An exposed port that forwards bytes without TLS
-  termination, reachable from the control sandbox, plus a stable address for
-  it.
+## What the end-to-end test found
 
-In both cases the workload VM must be able to accept the connection with
-internet access turned off.
+Three fixes were needed before the first sandbox passed, in this order:
 
-Until one of these exists, the combined topology stays, and the README's
-warning about test credentials stands.
+1. **Loopback peers.** The sandbox runtime reset every tunnel connection,
+   because it rejects boundary peers that are loopback or share its own
+   address, and the Tensorlake tunnel always delivers to `127.0.0.1`. The
+   veth forwarder gives the runtime a non-loopback peer.
+2. **PID namespace.** With a working channel, every connection was denied
+   with `transparent_tcp_identity_unavailable`. Binary identity resolution
+   walks a connecting process's ancestors up to its PID namespace init. In
+   the VM's root PID namespace that walk reached the root-owned launcher,
+   which the runtime cannot read. The runtime now runs as PID 1 of its own
+   PID namespace with a fresh procfs, in both topologies.
+3. **Transparent TCP capability.** The guard was granted
+   `policy-dns-transparent-tcp`, which Docker and Podman use because their
+   guard shares the workload's network namespace. This guard never does, so
+   the capability is gone, as in the Kubernetes driver.
 
-## Open questions
+A policy change reaches the guard on its next settings poll, a few seconds
+after `openshell policy update` returns. Pass `--wait` to block until it is
+effective.
 
-- Does a Tensorlake network policy with `allow_internet_access: false` block
-  inbound connections too, or only outbound?
-- How many supervisor processes can the control sandbox run with 2 vCPUs and
-  4 GiB? The VM driver's supervisor is small, but the limit sets the
-  per-control-plane sandbox count.
-- Can the driver learn the workload VM's address before the launcher starts,
-  so the guard bundle is complete at launch time, or must it start the
-  supervisor only after the first poll shows the address?
+## Open items
+
+- Which hosts `tl sbx tunnel` contacts, so `--allow-out` on the guard VM
+  can be tight. Until measured, leave the guard VM's internet on and rely
+  on OpenShell policy, as the combined topology did.
+- Tunnel reconnection. If the WebSocket drops, the guard launcher exits and
+  the sandbox is reported failed. A reconnecting tunnel would turn that into
+  a pause.
+- Scoped Tensorlake keys for tunnels.

@@ -19,11 +19,15 @@ connection to the gateway. The workload (`openshell-sandbox`) runs the
 agent's commands. The workload has no network of its own. Every connection
 it makes goes through the guard, and the guard applies the policy.
 
-In this version, the guard and the workload share one VM. The guard keeps
-the gateway and provider credentials inside that VM, so a root user in the
-VM could read them. Use test credentials only. The plan to move the guard
-out of the workload VM, and the one Tensorlake capability it needs, is in
+By default the guard and the workload run in two different VMs (the
+"split" topology). The workload VM has no outbound network at all, and the
+guard VM reaches it through a Tensorlake tunnel. Credentials never enter
+the VM that runs the agent. The design and its measurements are in
 [docs/split-topology.md](docs/split-topology.md).
+
+With `--topology combined`, both run in one VM. That is cheaper, but a root
+user in that VM can read the guard's credentials. Use it with test
+credentials only.
 
 The user-facing page is
 [Tensorlake Runtime](../../docs/how-it-works/sandboxes/tensorlake.mdx).
@@ -34,62 +38,87 @@ The user-facing page is
 openshell CLI ──► gateway ──Unix socket──► openshell-driver-tensorlake ──HTTPS──► Tensorlake API
                      ▲
                      │ the guard calls the gateway (outbound only)
-  ┌──────────────────┴──────── Tensorlake sandbox (VM) ───────────────────┐
-  │ ┌───────────────── OpenShell sandbox ───────────────────────────────┐ │
-  │ │ guard: openshell-supervisor (uid 65534, holds credentials)        │ │
-  │ │        ▲ TLS over /.openshell/channel/sandbox/control.sock        │ │
-  │ │ workload: openshell-sandbox (uid 1000, private network with       │ │
-  │ │        only loopback) ──► agent processes                         │ │
-  │ └───────────────────────────────────────────────────────────────────┘ │
-  └───────────────────────────────────────────────────────────────────────┘
+  ┌──────────────────┴── guard VM: openshell-<id>-guard ──┐   ┌── workload VM: openshell-<id> ─────────┐
+  │ guard: openshell-supervisor (uid 65534, credentials)  │   │ 127.0.0.1:8443 socat forwarder (65533)  │
+  │   │ OpenShell TLS, end to end                         │   │   │ veth 169.254.77.1 -> .2:8444        │
+  │   ▼                                                   │   │ ┌─▼─ network namespace ───────────────┐ │
+  │ 127.0.0.1:18443 ◄── tl sbx tunnel (uid 65533, TL key) ┼───┼─► openshell-sandbox (uid 1000) :8444  │ │
+  │ network: internet, or --allow-out                     │   │ │   └─► agent processes, loopback only │ │
+  └───────────────────────────────────────────────────────┘   │ └─────────────────────────────────────┘ │
+                                                              │ network: no outbound path at all        │
+                                                              └─────────────────────────────────────────┘
 ```
 
 When the gateway asks for a new sandbox:
 
-1. The driver asks Tensorlake to create a VM and returns at once. It does
-   not wait for the VM.
-2. In the background, the driver waits until the VM reports `running`.
-3. The driver packs the files the guard and the workload need into one
-   archive. Each file in the archive has its owner and permissions set.
-   The driver uploads the archive with the Tensorlake file API and starts
-   `/opt/openshell/bin/openshell-tensorlake-launch` as root with the
-   Tensorlake process API.
-4. The launch script unpacks the archive and deletes it. It starts the
-   workload in a private network that has only loopback. Then it starts
-   the guard as user 65534, with no special rights.
-5. The driver reports the sandbox as ready when the launch script starts.
-   The gateway marks the sandbox ready when the guard connects to it.
-   During steps 1 to 5 the driver publishes progress events, so the CLI
-   shows the VM request, the VM start, the bundle upload, and the wait for
-   the guard instead of a silent spinner.
-6. Every few seconds, the driver checks that the launch script is still
-   running. If it stopped, the driver marks the sandbox as failed with
-   reason `LauncherExited` and the exit status. Tensorlake does not
-   restart the script.
+1. The driver asks Tensorlake to create two VMs and returns at once. The
+   workload VM uses the sandbox image and a network policy with internet
+   access off and an empty allow list. The guard VM uses the guard image
+   (by default the same image) with 1 vCPU and 1 GiB.
+2. In the background, the driver waits until both VMs report `running`.
+3. The driver packs two archives. Each file has its owner and permissions
+   set. The workload archive holds the channel bootstrap and the channel
+   server key. The guard archive holds the gateway credentials, the
+   runtime descriptor that points at `127.0.0.1:18443`, and a Tensorlake
+   key for the tunnel. The driver uploads each archive with the Tensorlake
+   file API and starts `/opt/openshell/bin/openshell-tensorlake-launch` as
+   root in each VM with the Tensorlake process API.
+4. In the workload VM, the launch script creates a network namespace with
+   loopback and one veth link, starts `openshell-sandbox` inside it, where
+   it listens on port 8444, and starts a `socat` forwarder as user 65533
+   that accepts the tunnel on `127.0.0.1:8443` and connects over the veth
+   link. The forwarder exists because the runtime rejects loopback peers
+   and the Tensorlake tunnel always delivers to loopback. In the guard VM,
+   the script starts `tl sbx tunnel` as user 65533, which listens on
+   `127.0.0.1:18443` and relays bytes to port 8443 of the workload VM, and
+   the guard as user 65534. Neither user can read the other's files. The
+   guard's TLS handshake runs end to end to the workload; the tunnel and
+   the forwarder do not inspect the bytes. In both topologies the workload
+   runtime is PID 1 of its own PID namespace, so network policy can resolve
+   which binary opened a connection.
+5. The driver reports the sandbox as ready when both launch scripts
+   started. The gateway marks the sandbox ready when the guard connects to
+   it. During steps 1 to 5 the driver publishes progress events, so the
+   CLI shows the VM request, the VM start, the bundle upload, and the wait
+   for the guard instead of a silent spinner.
+6. Every few seconds, the driver checks that both launch scripts are still
+   running and both VMs still exist. If a script stopped, the driver marks
+   the sandbox as failed with reason `LauncherExited`, the role, and the
+   exit status. If a VM is gone, the reason is `TensorlakeTerminated`.
+   Tensorlake does not restart the script.
 
 Tensorlake cannot push changes to the driver. So the driver asks Tensorlake
 for the list of sandboxes every few seconds.
 
-### Where the files live in the VM
+With `--topology combined`, step 1 creates one VM, step 3 packs one
+archive, and the launch script starts the workload in a private network
+namespace that has only loopback, then the guard, in that VM.
 
-| Path | Owner | Contents |
-|---|---|---|
-| `/.openshell/channel/sandbox/` | workload | bootstrap file and TLS key for the channel to the guard |
-| `/.openshell/supervisor/` (mode 0700) | guard | auth bundle, sandbox token, gateway CA, runtime descriptor |
-| `/.openshell/supervisor/env`, `args` | root | the guard's environment and arguments |
+### Where the files live in the VMs
 
-The workload user cannot read the guard's files. Root in the VM can.
+| Path | VM | Owner | Contents |
+|---|---|---|---|
+| `/.openshell/channel/sandbox/` | workload | workload | bootstrap file and TLS key for the channel to the guard |
+| `/.openshell/supervisor/` (mode 0700) | guard | guard | auth bundle, sandbox token, gateway CA, runtime descriptor |
+| `/.openshell/supervisor/env`, `args` | guard | root | the guard's environment and arguments |
+| `/.openshell/tunnel/` (mode 0700) | guard | tunnel | the Tensorlake key and the `tl sbx tunnel` arguments |
+| `/.openshell/launch/params` | both | root | the role and the identities for the launch script |
+
+In the combined topology all of these except the tunnel files live in the
+one VM.
 
 ### The outer fence
 
-The launch script runs the workload in a network that has only loopback.
-The only way out is the channel to the guard. The driver writes this launch
-recipe into the sandbox's config, so the gateway knows which fence this
-sandbox got. The driver cannot look inside the VM to confirm that the fence
-is in place.
+The workload runs in a network namespace whose only link leads to the
+forwarder, and the workload VM gets a Tensorlake network policy that turns
+off every outbound connection, DNS included. The only way out is the
+channel to the guard, which arrives through the tunnel. The driver writes this recipe into
+the sandbox's config, so the gateway knows which fence this sandbox got.
+Tensorlake does not report the applied policy, so the driver cannot confirm
+it from outside.
 
-You can add a second wall with `--allow-out`. It limits where the guard
-itself can connect. See [Run the driver](#run-the-driver).
+`--allow-out` limits where the guard VM itself can connect. See
+[Run the driver](#run-the-driver).
 
 ## Build the images
 
@@ -99,8 +128,12 @@ Images built this way start fast.
 
 | Image | Default name | Contents |
 |---|---|---|
-| Sandbox | `openshell-tensorlake` | guard, workload, launch script |
+| Sandbox | `openshell-tensorlake` | guard, workload, Tensorlake CLI, socat, launch script |
 | Control | `openshell-control` | gateway, this driver, start script |
+
+The sandbox image serves both VMs of a sandbox. The workload VM runs the
+workload runtime from it, the guard VM runs the tunnel and the guard from
+it. Set `--guard-image` to use a different image for guard VMs.
 
 ```shell
 crates/openshell-driver-tensorlake/build-images.sh
@@ -196,9 +229,12 @@ openshell-gateway --compute-driver tensorlake \
 | `--tensorlake-api-url` | `TENSORLAKE_API_URL` | `https://sandbox.tensorlake.ai` |
 | `--tensorlake-api-key` | `TENSORLAKE_API_KEY` | required |
 | `--sandbox-image` | `OPENSHELL_SANDBOX_IMAGE` | required |
+| `--topology` | `OPENSHELL_TENSORLAKE_TOPOLOGY` | `split`; `combined` shares one VM |
+| `--guard-image` | `OPENSHELL_TENSORLAKE_GUARD_IMAGE` | the sandbox image |
+| `--guard-cpus` / `--guard-memory-mb` | `OPENSHELL_TENSORLAKE_GUARD_*` | 1 / 1024 |
 | `--cpus` / `--memory-mb` / `--disk-mb` | `OPENSHELL_TENSORLAKE_*` | 2 / 4096 / Tensorlake default |
 | `--timeout-secs` | `OPENSHELL_TENSORLAKE_TIMEOUT_SECS` | 0 (plan maximum) |
-| `--allow-out` | `OPENSHELL_TENSORLAKE_ALLOW_OUT` | empty (internet on) |
+| `--allow-out` | `OPENSHELL_TENSORLAKE_ALLOW_OUT` | empty (internet on for the guard VM) |
 | `--poll-interval-secs` | `OPENSHELL_TENSORLAKE_POLL_INTERVAL_SECS` | 3 |
 
 The guard trusts only the certificates in `--gateway-tls-ca`. It does not
@@ -211,7 +247,10 @@ pause a sandbox that is still working. Keep the default `0`, which uses the
 longest timeout your plan allows.
 
 When you set `--allow-out`, the driver turns off internet access for the
-VM and allows only the hosts you listed plus the gateway host.
+VM that runs the guard and allows only the hosts you listed, the gateway
+host, and in the split topology the Tensorlake host that the tunnel talks
+to. The workload VM in the split topology always has internet access off
+with an empty allow list.
 
 ## Run the control plane on Tensorlake
 
@@ -330,33 +369,54 @@ workloads in it.
 - The driver keeps launch state in memory. After a driver restart, it finds
   running sandboxes again by their Tensorlake names (`openshell-<id>`).
   Sandboxes that had not finished launching are reported as failed.
-- Anyone with access to your Tensorlake account can run
-  `tl sbx exec --user root` and get around OpenShell.
+- Anyone with access to your Tensorlake project can run
+  `tl sbx exec --user root` in the guard VM and read its credentials, or in
+  the workload VM and get around OpenShell policy. Keep the control plane
+  in a project of its own.
+- Each guard VM holds a Tensorlake API key for its tunnel. That key can
+  open tunnels to any sandbox in the project.
+- The split topology uses two Tensorlake VMs per sandbox.
 
 ## Verified on Tensorlake
 
-The unit tests cover the archive layout, request mapping, and status
-mapping. An end-to-end run (create a sandbox, run a command, read its
-output) confirmed that:
+The unit tests cover the archive layout, request mapping, pairing, and
+status mapping. End-to-end runs on Tensorlake Cloud confirmed:
 
-- the VM kernel supports Landlock and seccomp, and allows `unshare --net`;
-- the file API writes as root, and the process API runs the launch script
-  as root;
-- the guard reaches the gateway through the port proxy, which forwards the
-  calls to the plain HTTP/2 backend;
-- image builds accept the multi-stage Dockerfiles and the `--public` flag;
-- the Tensorlake dataplane supports the file and process APIs, exposed
-  ports, and managed processes.
+- Split topology (2026-10-20): create to Ready in about 4 seconds with two
+  VMs; `exec` runs as the workload user; the workload VM holds no gateway
+  token or Tensorlake key and only the runtime, the forwarder, and the
+  launch script run in it; DNS resolves through the guard; the default
+  policy denies egress; after `openshell policy update` allows one host
+  for `/usr/bin/curl`, that fetch returns 200, another host and the same
+  binary at another path stay denied, and the guard logs the binary
+  identity; 20 sequential fetches through guard and tunnel took 3.7
+  seconds; delete removes both VMs; a guard launcher exit is reported as
+  `LauncherExited`.
+- Both topologies: the VM kernel supports Landlock, seccomp, network, mount,
+  and PID namespaces; the file API writes as root and the process API runs
+  the launch script as root; the guard reaches the gateway through the port
+  proxy; image builds accept the multi-stage Dockerfiles and the `--public`
+  flag.
+
+Three findings shaped the split topology. The sandbox runtime rejects
+boundary peers on loopback, so the tunnel needs the veth forwarder. Binary
+identity resolution walks a process's ancestors to its PID namespace init,
+so the runtime must run in its own PID namespace, which also fixes policy
+enforcement in the combined topology. And the transparent TCP capability
+is for guards that share the workload's network namespace, so this driver
+no longer grants it.
 
 ## Still to confirm
 
 - The port proxy keeps a long-lived connection open, and the idle timeout
   does not pause a sandbox whose only traffic is the guard's outgoing
   session.
-- The conformance suite in `tests/suites/conformance` passes: lifecycle,
-  file transfer, and policy enforcement.
-- A launch script exit is reported as `LauncherExited`, and a driver
-  restart recovers running sandboxes.
+- The conformance suite in `tests/suites/conformance` passes: lifecycle and
+  file transfer.
+- A driver restart recovers running sandbox pairs.
+- The combined topology end to end after the PID namespace change.
+- Which Tensorlake hosts the tunnel needs, so `--allow-out` can be tight on
+  the guard VM.
 
 ## Test runbook
 
@@ -611,6 +671,7 @@ passes, because a published version cannot be replaced.
 
 - Stop and start.
 - GPU.
-- The split topology in [docs/split-topology.md](docs/split-topology.md),
-  so production credentials never enter a workload VM. It is blocked on a
-  raw TCP path between Tensorlake sandboxes.
+- Tensorlake keys scoped to one tunnel target, so a guard VM's key cannot
+  reach other sandboxes.
+- A tunnel that reconnects after a dropped WebSocket, so the sandbox pauses
+  instead of failing.
