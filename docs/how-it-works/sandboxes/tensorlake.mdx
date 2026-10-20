@@ -1,0 +1,197 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Tensorlake Runtime"
+sidebar-title: "Tensorlake"
+description: "Run OpenShell sandboxes in Tensorlake microVMs without local virtualization."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Tensorlake, MicroVM, Remote Compute"
+position: 5
+---
+
+The Tensorlake driver runs each OpenShell sandbox in its own
+[Tensorlake](https://tensorlake.ai) sandbox, a small virtual machine that
+Tensorlake creates and deletes for you. Use it when you want a VM boundary but
+have no local virtualization, or when you want sandboxes to run away from the
+gateway host.
+
+The driver is an extension driver. It runs as its own process next to the
+gateway and serves the compute driver API on a Unix socket. The CLI workflow
+does not change: you create, connect to, exec into, and delete sandboxes
+through the gateway as with any other runtime.
+
+The driver is experimental. Read [Trust model](#trust-model) before you attach
+real credentials.
+
+## How It Works
+
+Each OpenShell sandbox maps to one Tensorlake VM. The guard
+(`openshell-supervisor`) and the workload (`openshell-sandbox`) run inside that
+VM. The guard holds the gateway session and the provider credentials. The
+workload runs in a private network namespace with only loopback, so every
+connection it makes goes through the guard, and the guard applies the policy.
+
+The guard dials the gateway from inside Tensorlake. The gateway must therefore
+be reachable from the internet, or at least from Tensorlake. A gateway on a
+laptop behind NAT does not work. The supported setup runs the gateway and the
+driver together in one long-lived Tensorlake sandbox, the control plane, and
+protects it with OpenID Connect (OIDC) login.
+
+## Prerequisites
+
+- A Tensorlake account and API key.
+- The `tl` CLI, logged in to the project that will run the sandboxes:
+
+  ```shell
+  curl -fsSL https://tensorlake.ai/install | sh
+  tl login
+  ```
+
+- For a production control plane, an OIDC provider that puts roles in the
+  token. See [OIDC](/how-it-works/gateways/authentication#oidc).
+
+## Run the Control Plane on Tensorlake
+
+The control plane is one Tensorlake sandbox that runs the gateway and the
+driver. Guards in sandbox VMs reach it through the Tensorlake port proxy on a
+public URL. The proxy terminates TLS.
+
+1. Choose an image pair. Use a published pair, or build your own from a
+   source checkout with `crates/openshell-driver-tensorlake/build-images.sh`.
+   The control image records the name of its sandbox image, so the two always
+   match.
+
+2. Deploy. The script creates the control sandbox, exposes port 8080, uploads
+   the settings, and starts the control plane as a managed process that
+   restarts on failure:
+
+   ```shell
+   export TENSORLAKE_API_KEY=...
+   export CONTROL_IMAGE=openshell-control-<version>
+   export OPENSHELL_OIDC_ISSUER=https://idp.example.com/realms/openshell
+   export OPENSHELL_OIDC_AUDIENCE=openshell-cli
+   crates/openshell-driver-tensorlake/control/deploy.sh
+   ```
+
+   The script prints the public URL and the sandbox ID. Run it again to change
+   settings. Gateway state stays in the sandbox. Set `OPENSHELL_DB_URL` to use
+   an external database.
+
+3. Register the gateway with the CLI. The CLI opens a browser for the login
+   and renews the token on its own:
+
+   ```shell
+   openshell gateway add https://8080-<sandbox_id>.sandbox.tensorlake.ai \
+     --oidc-issuer https://idp.example.com/realms/openshell \
+     --oidc-client-id openshell-cli \
+     --oidc-audience openshell-cli
+   ```
+
+4. Create a sandbox:
+
+   ```shell
+   openshell sandbox create --name demo -- bash
+   ```
+
+   The first boot takes 30 to 60 seconds. The CLI shows the launch steps:
+   the VM request, the VM start, the launch bundle upload, and the wait for
+   the guard session.
+
+### Why Login Is Required
+
+Guards in sandbox VMs cannot hold a Tensorlake key, so the control-plane port
+must accept connections from anyone. The public URL cannot be hidden. The
+gateway makes this safe by checking every call for a valid OIDC token. A call
+without one gets `Unauthenticated`.
+
+For a short test without an identity provider, set
+`OPENSHELL_CONTROL_ALLOW_UNAUTHENTICATED=1` before you deploy, and reach the
+gateway through a Tensorlake tunnel instead of the public URL:
+
+```shell
+tl sbx tunnel openshell-control 8080 --listen-port 18080
+openshell gateway add http://127.0.0.1:18080 --name tensorlake
+```
+
+With this setting, anyone who has the public URL controls the gateway. Use it
+only with test credentials.
+
+## Run the Driver Next to Your Own Gateway
+
+If you already run a gateway that Tensorlake VMs can reach, run the driver on
+the same host as the same Unix user, and point the gateway at its socket. The
+gateway needs launch signing (`[openshell.gateway.gateway_jwt]`).
+
+```shell
+export TENSORLAKE_API_KEY=...
+openshell-driver-tensorlake \
+  --bind-socket /run/openshell/tensorlake.sock \
+  --grpc-endpoint https://gateway.example.com:8080 \
+  --gateway-tls-ca /etc/openshell/gateway-ca.pem \
+  --sandbox-image openshell-tensorlake-<version>
+```
+
+```toml
+[openshell.gateway]
+compute_driver = "tensorlake"
+
+[openshell.drivers.tensorlake]
+socket_path = "/run/openshell/tensorlake.sock"
+```
+
+| Flag | Environment | Default |
+|---|---|---|
+| `--grpc-endpoint` | `OPENSHELL_GRPC_ENDPOINT` | Required. The URL guards dial. |
+| `--gateway-tls-ca` | `OPENSHELL_TENSORLAKE_GATEWAY_TLS_CA` | Required for `https`. Guards trust only this bundle. |
+| `--sandbox-image` | `OPENSHELL_SANDBOX_IMAGE` | Required. A registered Tensorlake image with the guard and launcher. |
+| `--cpus`, `--memory-mb`, `--disk-mb` | `OPENSHELL_TENSORLAKE_*` | 2, 4096, Tensorlake default |
+| `--timeout-secs` | `OPENSHELL_TENSORLAKE_TIMEOUT_SECS` | `0`, the plan maximum |
+| `--allow-out` | `OPENSHELL_TENSORLAKE_ALLOW_OUT` | Empty. Internet on; the guard enforces policy. |
+
+Keep `--timeout-secs` at `0`. Tensorlake counts idle time from incoming
+traffic only, and the guard's traffic is outgoing, so a short timeout suspends
+a sandbox that is still working.
+
+`--allow-out` adds a second fence at the Tensorlake network. The driver turns
+off internet access for the VM and allows only the hosts you list plus the
+gateway host.
+
+## Images
+
+Sandbox images must contain the guard, the workload runtime, and the launch
+script. Build them on Tensorlake; no local Docker is needed:
+
+```shell
+crates/openshell-driver-tensorlake/build-images.sh
+```
+
+To add agent tools, build a derived image whose Dockerfile starts
+`FROM openshell-tensorlake-<version>`, register it with `tl sbx image create`,
+and pass its name to `openshell sandbox create --from`. The image must not
+contain `/.openshell`.
+
+Tensorlake has no image tags, so a version is part of the image name. Do not
+replace a published version. Publish a new one.
+
+## Trust Model
+
+The guard and the workload share one VM. The guard runs as an unprivileged
+user that the workload cannot read, and the workload has no network path
+except the channel to the guard. But a root user in the VM can read the
+guard's credentials, and anyone with access to the Tensorlake project can run
+`tl sbx exec --user root`. Until the guard moves to its own VM, use test
+credentials only, and keep the control plane in a Tensorlake project of its
+own.
+
+## Limits
+
+- Stop and start are not supported. Delete the sandbox instead.
+- Workload identity accepts numeric user and group IDs only. The default is
+  `1000:1000`.
+- No GPU, `driver_config`, `platform_config`, or `agent_socket_path`.
+- The driver polls Tensorlake every few seconds. Status changes can lag by
+  that much.
+- After a driver restart, sandboxes that had not finished launching are
+  reported as failed. Running sandboxes are recovered by name.
+
+For build details, the test runbook, and the design notes, see the
+[driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-tensorlake/README.md).
