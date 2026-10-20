@@ -152,8 +152,23 @@ impl TensorlakeComputeConfig {
                 ));
             }
         }
-        url::Url::parse(&self.api_url)
+        let api_url = url::Url::parse(&self.api_url)
             .map_err(|error| format!("invalid Tensorlake API URL: {error}"))?;
+        // The guard's tunnel receives this URL as TENSORLAKE_SANDBOX_API_URL.
+        // The tl CLI silently ignores values of any other shape and falls
+        // back to the public service, so reject them here.
+        if !matches!(api_url.scheme(), "http" | "https")
+            || api_url.host_str().is_none()
+            || api_url.query().is_some()
+            || api_url.fragment().is_some()
+            || !api_url.username().is_empty()
+            || api_url.password().is_some()
+        {
+            return Err(
+                "Tensorlake API URL must be an http or https URL with a host and no query, fragment, or credentials"
+                    .into(),
+            );
+        }
         if self.default_cpus.is_nan() || self.default_cpus <= 0.0 || self.default_memory_mb <= 0 {
             return Err("default CPU and memory must be positive".into());
         }
@@ -260,6 +275,25 @@ pub(crate) mod tests {
         let mut config = test_config();
         config.api_key = "tl_secret_value".into();
         assert!(!format!("{config:?}").contains("tl_secret_value"));
+    }
+
+    #[test]
+    fn validate_rejects_api_urls_the_tunnel_ignores() {
+        for api_url in [
+            "ftp://sandbox.example.test",
+            "https://sandbox.example.test/?scope=x",
+            "https://sandbox.example.test/#frag",
+            "https://user:pw@sandbox.example.test",
+        ] {
+            let mut config = test_config();
+            config.gateway_tls_ca = Some("ca".into());
+            config.api_url = api_url.into();
+            assert!(config.validate().is_err(), "{api_url}");
+        }
+        let mut config = test_config();
+        config.gateway_tls_ca = Some("ca".into());
+        config.api_url = "https://byoc.example.test:8443/base".into();
+        assert_eq!(config.validate(), Ok(()));
     }
 
     #[test]

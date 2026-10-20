@@ -163,15 +163,16 @@ start_workload() {
 # 127.0.0.1 in this VM, and the sandbox runtime rejects loopback peers, so
 # the forwarder accepts on loopback and connects into the workload namespace
 # from the veth address. It runs as an unprivileged identity with no files
-# of its own.
+# of its own. Every boundary RPC crosses both sockets as small frames, so
+# both disable Nagle (nodelay) to avoid delayed-ACK stalls.
 start_forwarder() {
     require_numeric "$FORWARDER_UID" "$FORWARDER_GID" "$WORKLOAD_LISTEN_PORT" "$WORKLOAD_FORWARD_PORT"
     log "starting tunnel forwarder 127.0.0.1:${WORKLOAD_FORWARD_PORT} -> ${VETH_WORKLOAD_ADDR}:${WORKLOAD_LISTEN_PORT}"
     setpriv --reuid="$FORWARDER_UID" --regid="$FORWARDER_GID" --clear-groups \
         --inh-caps=-all --bounding-set=-all --no-new-privs \
         env -i PATH=/usr/bin:/bin socat \
-        "TCP4-LISTEN:${WORKLOAD_FORWARD_PORT},bind=127.0.0.1,reuseaddr,fork" \
-        "TCP4:${VETH_WORKLOAD_ADDR}:${WORKLOAD_LISTEN_PORT},bind=${VETH_HOST_ADDR}" &
+        "TCP4-LISTEN:${WORKLOAD_FORWARD_PORT},bind=127.0.0.1,reuseaddr,fork,nodelay" \
+        "TCP4:${VETH_WORKLOAD_ADDR}:${WORKLOAD_LISTEN_PORT},bind=${VETH_HOST_ADDR},nodelay" &
     pids+=("$!")
 }
 

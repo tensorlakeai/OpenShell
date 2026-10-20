@@ -101,7 +101,7 @@ namespace that has only loopback, then the guard, in that VM.
 | `/.openshell/channel/sandbox/` (mode 0711) | workload | workload | bootstrap file, TLS certificate, and TLS key for the channel to the guard |
 | `/.openshell/supervisor/` (mode 0700) | guard | guard | auth bundle, sandbox token, gateway CA, runtime descriptor |
 | `/.openshell/supervisor/env`, `args` | guard | root | the guard's environment and arguments |
-| `/.openshell/tunnel/` (mode 0700) | guard | tunnel | `env` with the Tensorlake key |
+| `/.openshell/tunnel/` (mode 0700) | guard | tunnel | `env` with the Tensorlake key and the sandbox API URL |
 | `/.openshell/tunnel/args` | guard | root | the `tl sbx tunnel` arguments |
 | `/.openshell/launch/params` | both | root | the role and the identities for the launch script |
 | `/.openshell/launch/resolv.conf` | workload | root | written by the launch script; points the workload at the runtime's DNS relay |
