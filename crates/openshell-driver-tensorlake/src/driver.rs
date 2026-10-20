@@ -14,11 +14,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::{Stream, StreamExt as _};
+use openshell_core::progress::{
+    PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
+    mark_progress_active, mark_progress_complete, mark_progress_detail,
+};
 use openshell_core::proto::compute::v1::{
-    CpuResourceCapabilities, DriverCondition, DriverSandbox, DriverSandboxStatus,
-    GetCapabilitiesResponse, GpuResourceCapabilities, MemoryResourceCapabilities,
-    ResolvedWorkloadIdentity as ProtoIdentity, ResourceCapabilities, WatchSandboxesDeletedEvent,
-    WatchSandboxesEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
+    CpuResourceCapabilities, DriverCondition, DriverPlatformEvent, DriverSandbox,
+    DriverSandboxStatus, GetCapabilitiesResponse, GpuResourceCapabilities,
+    MemoryResourceCapabilities, ResolvedWorkloadIdentity as ProtoIdentity, ResourceCapabilities,
+    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
+    WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
 use openshell_core::resource_admission::DriverAdmissionConfig;
 use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
@@ -40,6 +45,9 @@ pub const NAME_PREFIX: &str = "openshell-";
 const PROVISION_TIMEOUT: Duration = Duration::from_mins(10);
 
 const WATCH_BUFFER: usize = 256;
+
+/// `source` of the platform events this driver publishes.
+const EVENT_SOURCE: &str = "tensorlake";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Phase {
@@ -433,6 +441,7 @@ impl TensorlakeComputeDriver {
             .await
             .insert(sandbox.id.clone(), record.clone());
         self.emit_sandbox(&record);
+        self.publish_progress(&sandbox.id, LaunchProgress::Accepted);
 
         let driver = self.clone();
         let sandbox = sandbox.clone();
@@ -442,6 +451,7 @@ impl TensorlakeComputeDriver {
                 .await
             {
                 warn!(sandbox_id = %sandbox.id, %message, "Tensorlake sandbox launch failed");
+                driver.publish_progress(&sandbox.id, LaunchProgress::Failed(&message));
                 driver
                     .set_phase(
                         &sandbox.id,
@@ -464,6 +474,7 @@ impl TensorlakeComputeDriver {
         identity: &ResolvedWorkloadIdentity,
     ) -> Result<(), String> {
         let started = Instant::now();
+        let mut last_pending_reason: Option<String> = None;
         let info = loop {
             if !self.is_active(&sandbox.id).await {
                 return Ok(());
@@ -475,7 +486,22 @@ impl TensorlakeComputeDriver {
                 .map_err(|error| error.to_string())?;
             match info.status.as_str() {
                 "running" => break info,
-                "pending" => {}
+                "pending" => {
+                    // Report a new pending reason once, not on every poll.
+                    let reason = info
+                        .pending_reason
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|reason| !reason.is_empty())
+                        .map(str::to_string);
+                    if reason.is_some() && reason != last_pending_reason {
+                        self.publish_progress(
+                            &sandbox.id,
+                            LaunchProgress::Pending(reason.as_deref().unwrap_or_default()),
+                        );
+                        last_pending_reason = reason;
+                    }
+                }
                 other => {
                     return Err(format!(
                         "Tensorlake sandbox entered state '{other}' before launch{}",
@@ -489,6 +515,8 @@ impl TensorlakeComputeDriver {
             tokio::time::sleep(self.config.poll_interval).await;
         };
         self.set_phase(&sandbox.id, Phase::Launching).await;
+        self.publish_progress(&sandbox.id, LaunchProgress::VmRunning);
+        self.publish_progress(&sandbox.id, LaunchProgress::UploadingBundle);
 
         let bundle = launch::build_launch_bundle(LaunchBundleInput {
             sandbox,
@@ -501,6 +529,7 @@ impl TensorlakeComputeDriver {
             .write_file(&info, launch::BUNDLE_UPLOAD_PATH, bundle)
             .await
             .map_err(|error| format!("upload launch bundle: {error}"))?;
+        self.publish_progress(&sandbox.id, LaunchProgress::StartingLauncher);
         let launcher = self
             .client
             .start_process(
@@ -524,6 +553,7 @@ impl TensorlakeComputeDriver {
             record.launcher_pid = Some(launcher.pid);
         }
         self.set_phase(&sandbox.id, Phase::Running).await;
+        self.publish_progress(&sandbox.id, LaunchProgress::LauncherStarted);
         Ok(())
     }
 
@@ -628,6 +658,20 @@ impl TensorlakeComputeDriver {
 
     fn emit_sandbox(&self, record: &Record) {
         let _ = self.events.send(sandbox_event(record.snapshot()));
+    }
+
+    /// Publish a launch progress event. The gateway forwards it to the CLI,
+    /// which shows the step on its provisioning spinner, so the user sees
+    /// what the driver waits for while the VM boots.
+    fn publish_progress(&self, sandbox_id: &str, progress: LaunchProgress<'_>) {
+        let _ = self.events.send(WatchSandboxesEvent {
+            payload: Some(watch_sandboxes_event::Payload::PlatformEvent(
+                WatchSandboxesPlatformEvent {
+                    sandbox_id: sandbox_id.to_string(),
+                    event: Some(progress.into_event()),
+                },
+            )),
+        });
     }
 
     /// Rebuild records for sandboxes this driver created before a restart.
@@ -802,6 +846,114 @@ fn failure_detail(info: &SandboxInfo) -> String {
         String::new()
     } else {
         format!(" ({})", parts.join("; "))
+    }
+}
+
+/// Launch steps the driver reports while a sandbox boots.
+///
+/// Tensorlake provides the image, so there is no pull step to show. The
+/// `pulling_image` step is completed together with the VM start, and the
+/// remaining time is shown under `starting_sandbox`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchProgress<'a> {
+    /// Tensorlake accepted the create request; the VM is not running yet.
+    Accepted,
+    /// Tensorlake reported why the VM is still pending.
+    Pending(&'a str),
+    /// The VM runs.
+    VmRunning,
+    /// The driver uploads the launch bundle.
+    UploadingBundle,
+    /// The driver starts the in-image launcher.
+    StartingLauncher,
+    /// The launcher runs; the gateway now waits for the guard session.
+    LauncherStarted,
+    /// Provisioning failed; the message explains why.
+    Failed(&'a str),
+}
+
+impl LaunchProgress<'_> {
+    fn into_event(self) -> DriverPlatformEvent {
+        let (event_type, reason, message) = match self {
+            Self::Accepted => (
+                "Normal",
+                "Accepted",
+                "Tensorlake accepted the sandbox request".to_string(),
+            ),
+            Self::Pending(reason) => (
+                "Normal",
+                "Pending",
+                format!("Tensorlake sandbox is pending: {reason}"),
+            ),
+            Self::VmRunning => ("Normal", "Running", "Tensorlake VM is running".to_string()),
+            Self::UploadingBundle => (
+                "Normal",
+                "UploadingBundle",
+                "Uploading the OpenShell launch bundle".to_string(),
+            ),
+            Self::StartingLauncher => (
+                "Normal",
+                "StartingLauncher",
+                "Starting the OpenShell launcher".to_string(),
+            ),
+            Self::LauncherStarted => (
+                "Normal",
+                "LauncherStarted",
+                "OpenShell launcher started; waiting for the guard session".to_string(),
+            ),
+            Self::Failed(message) => (
+                "Warning",
+                "LaunchFailed",
+                format!("Tensorlake sandbox launch failed: {message}"),
+            ),
+        };
+        let mut event = DriverPlatformEvent {
+            event_time: openshell_core::time::timestamp_from_millis(openshell_core::time::now_ms())
+                .ok(),
+            source: EVENT_SOURCE.to_string(),
+            r#type: event_type.to_string(),
+            reason: reason.to_string(),
+            message,
+            metadata: HashMap::new(),
+        };
+        let metadata = &mut event.metadata;
+        match self {
+            Self::Accepted => {
+                mark_progress_active(metadata, PROGRESS_STEP_REQUESTING_SANDBOX);
+                mark_progress_detail(metadata, "Waiting for the Tensorlake VM");
+            }
+            Self::Pending(reason) => {
+                mark_progress_active(metadata, PROGRESS_STEP_REQUESTING_SANDBOX);
+                mark_progress_detail(metadata, reason);
+            }
+            Self::VmRunning => {
+                mark_progress_complete(
+                    metadata,
+                    PROGRESS_STEP_REQUESTING_SANDBOX,
+                    "Tensorlake VM running",
+                );
+                mark_progress_active(metadata, PROGRESS_STEP_PULLING_IMAGE);
+            }
+            Self::UploadingBundle => {
+                mark_progress_complete(
+                    metadata,
+                    PROGRESS_STEP_PULLING_IMAGE,
+                    "Image provided by Tensorlake",
+                );
+                mark_progress_active(metadata, PROGRESS_STEP_STARTING_SANDBOX);
+                mark_progress_detail(metadata, "Uploading launch bundle");
+            }
+            Self::StartingLauncher => {
+                mark_progress_active(metadata, PROGRESS_STEP_STARTING_SANDBOX);
+                mark_progress_detail(metadata, "Starting OpenShell launcher");
+            }
+            Self::LauncherStarted => {
+                mark_progress_active(metadata, PROGRESS_STEP_STARTING_SANDBOX);
+                mark_progress_detail(metadata, "Waiting for the OpenShell guard");
+            }
+            Self::Failed(_) => {}
+        }
+        event
     }
 }
 
@@ -1018,6 +1170,81 @@ mod tests {
         assert!(message.contains("exited with status 1"));
         assert!(message.contains("tl sbx logs tl1"));
         assert!(launcher_failure("tl1", None).is_some());
+    }
+
+    #[test]
+    fn launch_progress_maps_to_cli_steps() {
+        use openshell_core::progress::{
+            PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
+            PROGRESS_COMPLETE_STEP_KEY,
+        };
+
+        let accepted = LaunchProgress::Accepted.into_event();
+        assert_eq!(accepted.source, EVENT_SOURCE);
+        assert_eq!(accepted.r#type, "Normal");
+        assert!(accepted.event_time.is_some());
+        assert_eq!(
+            accepted.metadata.get(PROGRESS_ACTIVE_STEP_KEY).unwrap(),
+            PROGRESS_STEP_REQUESTING_SANDBOX
+        );
+
+        let pending = LaunchProgress::Pending("waiting for capacity").into_event();
+        assert_eq!(
+            pending.metadata.get(PROGRESS_ACTIVE_DETAIL_KEY).unwrap(),
+            "waiting for capacity"
+        );
+        assert!(pending.message.contains("waiting for capacity"));
+
+        let running = LaunchProgress::VmRunning.into_event();
+        assert_eq!(
+            running.metadata.get(PROGRESS_COMPLETE_STEP_KEY).unwrap(),
+            PROGRESS_STEP_REQUESTING_SANDBOX
+        );
+        assert_eq!(
+            running.metadata.get(PROGRESS_COMPLETE_LABEL_KEY).unwrap(),
+            "Tensorlake VM running"
+        );
+
+        let uploading = LaunchProgress::UploadingBundle.into_event();
+        assert_eq!(
+            uploading.metadata.get(PROGRESS_COMPLETE_STEP_KEY).unwrap(),
+            PROGRESS_STEP_PULLING_IMAGE
+        );
+        assert_eq!(
+            uploading.metadata.get(PROGRESS_ACTIVE_STEP_KEY).unwrap(),
+            PROGRESS_STEP_STARTING_SANDBOX
+        );
+
+        for progress in [
+            LaunchProgress::StartingLauncher,
+            LaunchProgress::LauncherStarted,
+        ] {
+            let event = progress.into_event();
+            assert_eq!(
+                event.metadata.get(PROGRESS_ACTIVE_STEP_KEY).unwrap(),
+                PROGRESS_STEP_STARTING_SANDBOX
+            );
+            assert!(event.metadata.contains_key(PROGRESS_ACTIVE_DETAIL_KEY));
+        }
+
+        let failed = LaunchProgress::Failed("upload failed").into_event();
+        assert_eq!(failed.r#type, "Warning");
+        assert_eq!(failed.reason, "LaunchFailed");
+        assert!(failed.message.contains("upload failed"));
+        assert!(failed.metadata.is_empty());
+    }
+
+    #[tokio::test]
+    async fn progress_events_reach_watchers() {
+        let driver = driver();
+        let mut stream = Box::pin(driver.watch_sandboxes().await);
+        driver.publish_progress("sb-1", LaunchProgress::Accepted);
+        let event = stream.next().await.unwrap().unwrap();
+        let Some(watch_sandboxes_event::Payload::PlatformEvent(platform)) = event.payload else {
+            panic!("expected a platform event");
+        };
+        assert_eq!(platform.sandbox_id, "sb-1");
+        assert_eq!(platform.event.unwrap().reason, "Accepted");
     }
 
     #[test]
