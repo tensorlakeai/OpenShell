@@ -6,6 +6,7 @@ pub mod config;
 pub mod driver;
 pub mod grpc;
 pub mod launch;
+pub mod state;
 
 pub use config::TensorlakeComputeConfig;
 pub use driver::TensorlakeComputeDriver;

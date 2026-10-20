@@ -92,6 +92,9 @@ pub struct TensorlakeComputeConfig {
     pub guard_image: Option<String>,
     pub guard_cpus: f64,
     pub guard_memory_mb: i64,
+    /// Where the driver keeps a copy of each sandbox request, so that a
+    /// restart can report recovered sandboxes under their `OpenShell` names.
+    pub state_dir: PathBuf,
 }
 
 impl std::fmt::Debug for TensorlakeComputeConfig {
@@ -113,6 +116,7 @@ impl std::fmt::Debug for TensorlakeComputeConfig {
             .field("guard_image", &self.guard_image)
             .field("guard_cpus", &self.guard_cpus)
             .field("guard_memory_mb", &self.guard_memory_mb)
+            .field("state_dir", &self.state_dir)
             .finish()
     }
 }
@@ -229,6 +233,10 @@ pub(crate) mod tests {
             guard_image: None,
             guard_cpus: DEFAULT_GUARD_CPUS,
             guard_memory_mb: DEFAULT_GUARD_MEMORY_MB,
+            state_dir: std::env::temp_dir().join(format!(
+                "openshell-tensorlake-driver-test-{}",
+                std::process::id()
+            )),
         }
     }
 

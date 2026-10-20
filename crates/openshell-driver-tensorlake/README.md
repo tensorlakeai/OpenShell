@@ -238,6 +238,7 @@ openshell-gateway --compute-driver tensorlake \
 | `--timeout-secs` | `OPENSHELL_TENSORLAKE_TIMEOUT_SECS` | 0 (plan maximum) |
 | `--allow-out` | `OPENSHELL_TENSORLAKE_ALLOW_OUT` | empty (internet on for the guard VM) |
 | `--poll-interval-secs` | `OPENSHELL_TENSORLAKE_POLL_INTERVAL_SECS` | 3 |
+| `--state-dir` | `OPENSHELL_TENSORLAKE_STATE_DIR` | `target/openshell-tensorlake-driver`; the control plane uses `/var/lib/openshell/tensorlake` |
 | `--log-level` | `OPENSHELL_LOG_LEVEL` | `info`; also the default level for guards |
 | `--otlp-endpoint` | `OPENSHELL_OTLP_ENDPOINT` | none |
 | `--gateway-name` | `OPENSHELL_GATEWAY_NAME` | none; used in traces |
@@ -377,9 +378,14 @@ workloads in it.
 - The workload identity accepts a numeric user ID and group ID only. The
   default is 1000:1000.
 - No GPU, `driver_config`, `platform_config`, or `agent_socket_path`.
-- The driver keeps launch state in memory. After a driver restart, it finds
-  running sandboxes again by their Tensorlake names (`openshell-<id>` and
-  `openshell-<id>-guard`). A pair with a VM still pending is reported as
+- The driver keeps launch state in memory and a copy of each sandbox
+  request, without its credentials, under `--state-dir`. After a driver
+  restart, it finds running sandboxes again by their Tensorlake names
+  (`openshell-<id>` and `openshell-<id>-guard`) and reports them under the
+  names in the saved requests. Keep the state directory with the gateway
+  database: a recovered sandbox with no saved request has no name, and the
+  gateway then rejects every status update for it until it is deleted. A
+  pair with a VM still pending is reported as
   failed with reason `DriverRestarted`. A pair with one VM missing is
   reported as failed with reason `PairIncomplete`. A pair whose VMs were
   running but whose launch scripts had not started yet is recovered as
@@ -656,7 +662,9 @@ Ready with the exec printing `hello`, and `restart-b` Failed with reason
 `DriverRestarted` if a VM was still pending at restart time. If both VMs
 of `restart-b` were already running, the driver recovers it as running.
 It then becomes Ready only if its launch scripts had started before the
-restart. Record which case you saw.
+restart. Record which case you saw. The gateway log must show no
+`name cannot be changed after creation` error: the driver reports each
+recovered sandbox under the name in its saved request.
 
 #### 4. Idle timeout
 

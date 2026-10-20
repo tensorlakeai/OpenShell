@@ -107,6 +107,15 @@ struct Args {
         default_value_t = 3
     )]
     poll_interval_secs: u64,
+
+    /// Directory for a copy of each sandbox request. After a restart the
+    /// driver reads it to report recovered sandboxes under their names.
+    #[arg(
+        long,
+        env = "OPENSHELL_TENSORLAKE_STATE_DIR",
+        default_value = "target/openshell-tensorlake-driver"
+    )]
+    state_dir: PathBuf,
 }
 
 #[tokio::main]
@@ -144,6 +153,7 @@ async fn main() -> Result<()> {
         guard_image: args.guard_image,
         guard_cpus: args.guard_cpus,
         guard_memory_mb: args.guard_memory_mb,
+        state_dir: args.state_dir,
     };
     let driver = TensorlakeComputeDriver::new(config, args.admission_config_json)
         .await

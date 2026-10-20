@@ -38,6 +38,7 @@ use crate::client::{
 };
 use crate::config::{TensorlakeComputeConfig, Topology};
 use crate::launch::{self, LaunchBundleInput};
+use crate::state::StateStore;
 
 /// Prefix for Tensorlake sandbox names created by this driver.
 pub const NAME_PREFIX: &str = "openshell-";
@@ -242,6 +243,8 @@ pub struct TensorlakeComputeDriver {
     gateway_ca_pem: Option<Arc<Vec<u8>>>,
     records: Arc<Mutex<HashMap<String, Record>>>,
     events: broadcast::Sender<WatchSandboxesEvent>,
+    /// Saved sandbox requests, read back after a restart.
+    state: StateStore,
 }
 
 impl std::fmt::Debug for TensorlakeComputeDriver {
@@ -272,6 +275,7 @@ impl TensorlakeComputeDriver {
         let client =
             TensorlakeClient::new(&config.api_url, &config.api_key).map_err(|e| e.to_string())?;
         let (events, _) = broadcast::channel(WATCH_BUFFER);
+        let state = StateStore::new(&config.state_dir);
         let driver = Self {
             client,
             config: Arc::new(config),
@@ -279,6 +283,7 @@ impl TensorlakeComputeDriver {
             gateway_ca_pem,
             records: Arc::new(Mutex::new(HashMap::new())),
             events,
+            state,
         };
         driver.recover().await?;
         let poller = driver.clone();
@@ -289,6 +294,7 @@ impl TensorlakeComputeDriver {
     #[cfg(test)]
     fn for_tests(config: TensorlakeComputeConfig) -> Self {
         let (events, _) = broadcast::channel(WATCH_BUFFER);
+        let state = StateStore::new(&config.state_dir);
         Self {
             client: TensorlakeClient::new(&config.api_url, &config.api_key).unwrap(),
             config: Arc::new(config),
@@ -296,6 +302,7 @@ impl TensorlakeComputeDriver {
             gateway_ca_pem: None,
             records: Arc::new(Mutex::new(HashMap::new())),
             events,
+            state,
         }
     }
 
@@ -449,7 +456,19 @@ impl TensorlakeComputeDriver {
             guard_network.clone()
         };
         let name = tensorlake_name(&sandbox.id);
-        let created = self
+        // Keep secrets out of the stored record; only the provisioning task
+        // sees the launch credentials. Save it before any VM exists, so a
+        // restart always finds the record for a VM it finds.
+        let mut stored = sandbox.clone();
+        if let Some(spec) = stored.spec.as_mut() {
+            spec.sandbox_token.clear();
+            spec.launch_authentication.clear();
+        }
+        self.state
+            .save(&stored)
+            .await
+            .map_err(|error| Status::internal(format!("save sandbox record: {error}")))?;
+        let created = match self
             .client
             .create_sandbox(&CreateSandboxRequest {
                 image: Some(self.image_for(sandbox)),
@@ -460,7 +479,13 @@ impl TensorlakeComputeDriver {
                 wait: Some(false),
             })
             .await
-            .map_err(create_error)?;
+        {
+            Ok(created) => created,
+            Err(error) => {
+                self.discard_state(&sandbox.id).await;
+                return Err(create_error(error));
+            }
+        };
         info!(
             sandbox_id = %sandbox.id,
             tensorlake_sandbox_id = %created.sandbox_id,
@@ -501,6 +526,7 @@ impl TensorlakeComputeDriver {
                             "Failed to delete the workload VM after the guard VM create failed"
                         );
                     }
+                    self.discard_state(&sandbox.id).await;
                     return Err(create_error(error));
                 }
             }
@@ -508,13 +534,6 @@ impl TensorlakeComputeDriver {
             None
         };
 
-        // Keep secrets out of the stored record; only the provisioning task
-        // sees the launch credentials.
-        let mut stored = sandbox.clone();
-        if let Some(spec) = stored.spec.as_mut() {
-            spec.sandbox_token.clear();
-            spec.launch_authentication.clear();
-        }
         let record = Record {
             sandbox: stored,
             tensorlake_id: created.sandbox_id.clone(),
@@ -801,6 +820,7 @@ impl TensorlakeComputeDriver {
 
     async fn forget(&self, sandbox_id: &str) {
         if self.records.lock().await.remove(sandbox_id).is_some() {
+            self.discard_state(sandbox_id).await;
             let _ = self.events.send(WatchSandboxesEvent {
                 payload: Some(watch_sandboxes_event::Payload::Deleted(
                     WatchSandboxesDeletedEvent {
@@ -808,6 +828,13 @@ impl TensorlakeComputeDriver {
                     },
                 )),
             });
+        }
+    }
+
+    /// Remove the saved request of a sandbox that no longer exists.
+    async fn discard_state(&self, sandbox_id: &str) {
+        if let Err(error) = self.state.remove(sandbox_id).await {
+            warn!(sandbox_id, %error, "Failed to remove the saved sandbox record");
         }
     }
 
@@ -831,41 +858,55 @@ impl TensorlakeComputeDriver {
 
     /// Rebuild records for sandboxes this driver created before a restart.
     /// Launch credentials are not kept, so pending sandboxes cannot finish
-    /// launching and are reported as failed.
+    /// launching and are reported as failed. The saved request gives each
+    /// record back its `OpenShell` name; the gateway rejects a snapshot
+    /// whose name differs from its own record.
     async fn recover(&self) -> Result<(), String> {
         let sandboxes = self
             .client
             .list_sandboxes()
             .await
             .map_err(|error| format!("list Tensorlake sandboxes: {error}"))?;
-        let mut records = self.records.lock().await;
+        let mut recovered = Vec::new();
         for (sandbox_id, workload, guard) in pair_by_name(&sandboxes) {
             let Some(phase) = recovered_phase(workload, guard, self.config.topology) else {
                 continue;
             };
-            // A guard VM whose workload VM is gone is still recorded, under
-            // the workload's name, so that delete can remove it.
-            let Some(anchor) = workload.or(guard) else {
-                continue;
+            let saved = match self.state.load(sandbox_id).await {
+                Ok(saved) => saved,
+                Err(error) => {
+                    warn!(sandbox_id, %error, "Failed to read the saved sandbox record");
+                    None
+                }
             };
-            records.insert(
-                sandbox_id.to_string(),
-                Record {
-                    sandbox: DriverSandbox {
-                        id: sandbox_id.to_string(),
-                        ..DriverSandbox::default()
-                    },
-                    tensorlake_id: workload
-                        .map_or_else(|| anchor.sandbox_id.clone(), |info| info.sandbox_id.clone()),
-                    tensorlake_name: tensorlake_name(sandbox_id),
-                    guard_tensorlake_id: guard.map(|info| info.sandbox_id.clone()),
-                    identity: None,
-                    phase,
-                    launcher_pid: None,
-                    guard_launcher_pid: None,
-                },
-            );
+            if saved.is_none() {
+                warn!(
+                    sandbox_id,
+                    "No saved record for this sandbox; the gateway cannot update its status. Delete and recreate it"
+                );
+            }
+            if let Some(record) = recovered_record(sandbox_id, saved, workload, guard, phase) {
+                recovered.push((sandbox_id.to_string(), record));
+            }
         }
+        // A saved request whose VMs are gone, for example terminated with
+        // `tl` while the driver was down, has nothing left to recover.
+        match self.state.saved_ids().await {
+            Ok(ids) => {
+                for id in ids {
+                    if !recovered
+                        .iter()
+                        .any(|(recovered_id, _)| *recovered_id == id)
+                    {
+                        info!(sandbox_id = %id, "Dropping the saved record of a sandbox with no VMs");
+                        self.discard_state(&id).await;
+                    }
+                }
+            }
+            Err(error) => warn!(%error, "Failed to list the saved sandbox records"),
+        }
+        let mut records = self.records.lock().await;
+        records.extend(recovered);
         info!(recovered = records.len(), "Recovered Tensorlake sandboxes");
         Ok(())
     }
@@ -970,6 +1011,33 @@ fn pair_by_name(
 
 /// Phase for a pair found after a driver restart. `None` means nothing is
 /// left to track.
+/// The record for a sandbox found at restart. `saved` is the request the
+/// gateway sent at create, when the state store still has it. A guard VM
+/// whose workload VM is gone is still recorded, under the workload's name,
+/// so that delete can remove it.
+fn recovered_record(
+    sandbox_id: &str,
+    saved: Option<DriverSandbox>,
+    workload: Option<&SandboxInfo>,
+    guard: Option<&SandboxInfo>,
+    phase: Phase,
+) -> Option<Record> {
+    let anchor = workload.or(guard)?;
+    let mut sandbox = saved.unwrap_or_default();
+    sandbox.id = sandbox_id.to_string();
+    sandbox.status = None;
+    Some(Record {
+        sandbox,
+        tensorlake_id: anchor.sandbox_id.clone(),
+        tensorlake_name: tensorlake_name(sandbox_id),
+        guard_tensorlake_id: guard.map(|info| info.sandbox_id.clone()),
+        identity: None,
+        phase,
+        launcher_pid: None,
+        guard_launcher_pid: None,
+    })
+}
+
 fn recovered_phase(
     workload: Option<&SandboxInfo>,
     guard: Option<&SandboxInfo>,
@@ -1506,6 +1574,51 @@ mod tests {
         assert_eq!(parse_tensorlake_name("openshell-"), None);
         assert_eq!(parse_tensorlake_name("openshell--guard"), None);
         assert_eq!(parse_tensorlake_name(&format!("other-{ID}")), None);
+    }
+
+    #[test]
+    fn recovered_record_reports_the_saved_name() {
+        let id = "aaaaaaaa-0000-4000-8000-000000000001";
+        let workload = named(&format!("openshell-{id}"), "running");
+        let guard = named(&format!("openshell-{id}-guard"), "running");
+        let saved = DriverSandbox {
+            id: id.into(),
+            name: "demo".into(),
+            namespace: "default".into(),
+            workspace: "ws".into(),
+            status: Some(DriverSandboxStatus::default()),
+            ..DriverSandbox::default()
+        };
+
+        let record = recovered_record(
+            id,
+            Some(saved),
+            Some(&workload),
+            Some(&guard),
+            Phase::Running,
+        )
+        .unwrap();
+        let snapshot = record.snapshot();
+        assert_eq!(snapshot.id, id);
+        assert_eq!(snapshot.name, "demo");
+        assert_eq!(snapshot.namespace, "default");
+        assert_eq!(snapshot.workspace, "ws");
+        assert_eq!(record.tensorlake_id, workload.sandbox_id);
+        assert_eq!(
+            record.guard_tensorlake_id.as_deref(),
+            Some(guard.sandbox_id.as_str())
+        );
+        let status = snapshot.status.unwrap();
+        assert_eq!(status.name, format!("openshell-{id}"));
+        assert_eq!(status.conditions[0].reason, "TensorlakeRunning");
+
+        // Without the saved request only the ID is known.
+        let record = recovered_record(id, None, None, Some(&guard), Phase::Suspended).unwrap();
+        assert_eq!(record.sandbox.id, id);
+        assert!(record.sandbox.name.is_empty());
+        assert_eq!(record.tensorlake_id, guard.sandbox_id);
+
+        assert!(recovered_record(id, None, None, None, Phase::Running).is_none());
     }
 
     #[test]

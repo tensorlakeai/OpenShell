@@ -155,6 +155,7 @@ socket_path = "/run/openshell/tensorlake.sock"
 | `--cpus`, `--memory-mb`, `--disk-mb` | `OPENSHELL_TENSORLAKE_*` | 2, 4096, Tensorlake default |
 | `--timeout-secs` | `OPENSHELL_TENSORLAKE_TIMEOUT_SECS` | `0`, the plan maximum |
 | `--allow-out` | `OPENSHELL_TENSORLAKE_ALLOW_OUT` | Empty. Internet on for the guard VM; the guard enforces policy. |
+| `--state-dir` | `OPENSHELL_TENSORLAKE_STATE_DIR` | `target/openshell-tensorlake-driver`. Holds a copy of each sandbox request for recovery after a restart. |
 
 Keep `--timeout-secs` at `0`. Tensorlake counts idle time from incoming
 traffic only, and the guard's traffic is outgoing, so a short timeout suspends
@@ -212,7 +213,8 @@ credentials. Use it with test credentials only.
 - The driver polls Tensorlake every few seconds. Status changes can lag by
   that much.
 - After a driver restart, sandboxes that had not finished launching are
-  reported as failed. Running sandboxes are recovered by name.
+  reported as failed. Running sandboxes are recovered from the saved
+  requests in `--state-dir`. Keep that directory with the gateway database.
 - The split topology uses two Tensorlake VMs per sandbox. The guard VM
   defaults to 1 vCPU and 1 GiB.
 

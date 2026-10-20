@@ -108,7 +108,8 @@ trap 'exit 143' TERM INT
     --gateway-name "${GATEWAY_NAME}" \
     --grpc-endpoint "${OPENSHELL_CONTROL_PUBLIC_URL}" \
     --gateway-tls-ca "${PUBLIC_CA}" \
-    --sandbox-image "${OPENSHELL_SANDBOX_IMAGE}" &
+    --sandbox-image "${OPENSHELL_SANDBOX_IMAGE}" \
+    --state-dir "${STATE_DIR}/tensorlake" &
 DRIVER_PID=$!
 
 for _ in $(seq 1 50); do

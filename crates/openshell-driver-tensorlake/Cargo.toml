@@ -24,6 +24,7 @@ tar = "0.4"
 
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
+prost = { workspace = true }
 futures = { workspace = true }
 tokio-stream = { workspace = true, features = ["sync"] }
 reqwest = { workspace = true }

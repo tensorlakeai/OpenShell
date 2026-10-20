@@ -4622,6 +4622,7 @@ dependencies = [
  "openshell-isolation-interface",
  "openshell-otel",
  "openshell-sandbox-backend",
+ "prost",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
