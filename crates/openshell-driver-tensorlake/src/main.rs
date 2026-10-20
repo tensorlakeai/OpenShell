@@ -10,7 +10,10 @@ use tracing::info;
 
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
-use openshell_driver_tensorlake::config::{DEFAULT_API_URL, DEFAULT_CPUS, DEFAULT_MEMORY_MB};
+use openshell_driver_tensorlake::config::{
+    DEFAULT_API_URL, DEFAULT_CPUS, DEFAULT_GUARD_CPUS, DEFAULT_GUARD_MEMORY_MB, DEFAULT_MEMORY_MB,
+    Topology,
+};
 use openshell_driver_tensorlake::{
     ComputeDriverService, TensorlakeComputeConfig, TensorlakeComputeDriver,
 };
@@ -56,9 +59,26 @@ struct Args {
     #[arg(long, env = "TENSORLAKE_API_KEY", hide_env_values = true)]
     tensorlake_api_key: String,
 
-    /// Registered Tensorlake image with the `OpenShell` guard and launcher.
+    /// Registered Tensorlake image with the `OpenShell` runtime and launcher.
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE")]
     sandbox_image: String,
+
+    /// Where the guard runs. `split` puts it in its own VM and reaches the
+    /// workload VM through a Tensorlake tunnel, so credentials never enter
+    /// the workload VM. `combined` shares one VM; test credentials only.
+    #[arg(long, env = "OPENSHELL_TENSORLAKE_TOPOLOGY", default_value = "split")]
+    topology: Topology,
+
+    /// Registered Tensorlake image for guard VMs. Defaults to the sandbox
+    /// image, which contains the guard and the Tensorlake CLI.
+    #[arg(long, env = "OPENSHELL_TENSORLAKE_GUARD_IMAGE")]
+    guard_image: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_TENSORLAKE_GUARD_CPUS", default_value_t = DEFAULT_GUARD_CPUS)]
+    guard_cpus: f64,
+
+    #[arg(long, env = "OPENSHELL_TENSORLAKE_GUARD_MEMORY_MB", default_value_t = DEFAULT_GUARD_MEMORY_MB)]
+    guard_memory_mb: i64,
 
     #[arg(long, env = "OPENSHELL_TENSORLAKE_CPUS", default_value_t = DEFAULT_CPUS)]
     cpus: f64,
@@ -120,6 +140,10 @@ async fn main() -> Result<()> {
             .collect(),
         poll_interval: Duration::from_secs(args.poll_interval_secs.max(1)),
         log_level: args.log_level,
+        topology: args.topology,
+        guard_image: args.guard_image,
+        guard_cpus: args.guard_cpus,
+        guard_memory_mb: args.guard_memory_mb,
     };
     let driver = TensorlakeComputeDriver::new(config, args.admission_config_json)
         .await

@@ -4,8 +4,11 @@
 # Tensorlake sandbox image for the OpenShell Tensorlake compute driver.
 #
 # It adds the OpenShell guard (openshell-supervisor), the workload runtime
-# (openshell-sandbox), and the launcher to an Ubuntu base. Add agent tools
-# (for example Claude Code) in a derived image.
+# (openshell-sandbox), the Tensorlake CLI for the guard's tunnel, and the
+# launcher to an Ubuntu base. One image serves both VMs of a sandbox: the
+# workload VM runs openshell-sandbox from it, the guard VM runs the tunnel
+# and openshell-supervisor from it. Add agent tools (for example Claude
+# Code) in a derived image; the guard VM ignores them.
 #
 # Build and register it on Tensorlake with ../build-images.sh (no local
 # Docker needed).
@@ -19,11 +22,20 @@ FROM ghcr.io/nvidia/openshell/sandbox:1cb9ef8ab469354a641893f8e26957e988f5c7ef A
 
 FROM ubuntu:24.04
 
-# iproute2: loopback in the workload network namespace.
-# util-linux: unshare and setpriv. ca-certificates: guard TLS to upstreams.
+# iproute2: the workload network namespace and its veth link. socat: the
+# forwarder from the Tensorlake tunnel into that namespace. util-linux:
+# unshare and setpriv. ca-certificates: guard TLS to upstreams and the
+# tunnel's TLS to the Tensorlake proxy. curl: the tl installer.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates iproute2 util-linux \
+    && apt-get install -y --no-install-recommends ca-certificates curl iproute2 socat util-linux \
     && rm -rf /var/lib/apt/lists/*
+
+# Tensorlake CLI. The guard VM runs `tl sbx tunnel` to reach the workload
+# VM's TLS listener. Pinned; the installer verifies the SHA256SUMS file.
+ENV TENSORLAKE_VERSION=cli-v0.5.154
+RUN curl -fsSL https://tensorlake.ai/install \
+    | TENSORLAKE_INSTALL=/opt/openshell sh \
+    && test -x /opt/openshell/bin/tl
 
 # Default workload identity (1000:1000), as in other OpenShell drivers.
 RUN if ! getent group 1000 >/dev/null; then groupadd --gid 1000 sandbox; fi \

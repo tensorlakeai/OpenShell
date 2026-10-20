@@ -78,6 +78,19 @@ pub struct NetworkPolicy {
     pub deny_out: Vec<String>,
 }
 
+impl NetworkPolicy {
+    /// No outbound path at all. With an empty allow list,
+    /// `allow_internet_access: false` turns off every outbound connection,
+    /// DNS included. Inbound tunnel traffic is not affected.
+    pub fn no_egress() -> Self {
+        Self {
+            allow_internet_access: false,
+            allow_out: Vec::new(),
+            deny_out: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateSandboxResponse {
     pub sandbox_id: String,

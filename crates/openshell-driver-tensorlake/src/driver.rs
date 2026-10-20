@@ -3,11 +3,12 @@
 
 //! Tensorlake compute driver.
 //!
-//! Each `OpenShell` sandbox maps to one Tensorlake sandbox (a Firecracker VM).
-//! Create returns after Tensorlake accepts the request. A background task then
-//! waits for the VM to run, uploads the launch bundle, and starts the in-image
-//! launcher as root. A poll loop keeps status current because Tensorlake has no
-//! watch API.
+//! Each `OpenShell` sandbox maps to one Tensorlake sandbox (a small VM) for
+//! the workload and, in the default split topology, a second one for the
+//! guard. Create returns after Tensorlake accepts the requests. A background
+//! task then waits for the VMs to run, uploads a launch bundle to each, and
+//! starts the in-image launcher as root. A poll loop keeps status current
+//! because Tensorlake has no watch API.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,11 +36,14 @@ use crate::client::{
     CreateSandboxRequest, NetworkPolicy, ProcessInfo, Resources, SandboxInfo, StartProcessRequest,
     TensorlakeClient, TensorlakeError,
 };
-use crate::config::TensorlakeComputeConfig;
+use crate::config::{TensorlakeComputeConfig, Topology};
 use crate::launch::{self, LaunchBundleInput};
 
 /// Prefix for Tensorlake sandbox names created by this driver.
 pub const NAME_PREFIX: &str = "openshell-";
+
+/// Suffix of the guard VM's Tensorlake name in the split topology.
+pub const GUARD_NAME_SUFFIX: &str = "-guard";
 
 /// How long a Tensorlake sandbox may stay pending before create fails.
 const PROVISION_TIMEOUT: Duration = Duration::from_mins(10);
@@ -68,12 +72,18 @@ enum Phase {
 #[derive(Debug, Clone)]
 struct Record {
     sandbox: DriverSandbox,
+    /// The workload VM, or the only VM in the combined topology.
     tensorlake_id: String,
     tensorlake_name: String,
+    /// The guard VM in the split topology.
+    guard_tensorlake_id: Option<String>,
     identity: Option<ResolvedWorkloadIdentity>,
     phase: Phase,
-    /// PID of the launcher in the VM. `None` for recovered records.
+    /// PID of the launcher in the workload VM. `None` for recovered records.
     launcher_pid: Option<i64>,
+    /// PID of the launcher in the guard VM. `None` for recovered records and
+    /// in the combined topology.
+    guard_launcher_pid: Option<i64>,
 }
 
 impl Record {
@@ -149,6 +159,38 @@ pub fn tensorlake_name(sandbox_id: &str) -> String {
         })
         .collect();
     format!("{NAME_PREFIX}{sanitized}")
+}
+
+/// Tensorlake name of the guard VM for an `OpenShell` sandbox ID.
+pub fn tensorlake_guard_name(sandbox_id: &str) -> String {
+    format!("{}{GUARD_NAME_SUFFIX}", tensorlake_name(sandbox_id))
+}
+
+/// Which `OpenShell` sandbox a Tensorlake name belongs to, and whether it is
+/// the guard VM. `None` for names this driver did not create, such as the
+/// control sandbox `openshell-control`. `OpenShell` sandbox IDs are UUIDs,
+/// and `tensorlake_name` keeps them intact, so the ID part must look like
+/// one.
+fn parse_tensorlake_name(name: &str) -> Option<(&str, bool)> {
+    let rest = name.strip_prefix(NAME_PREFIX)?;
+    let (id, guard) = rest
+        .strip_suffix(GUARD_NAME_SUFFIX)
+        .map_or((rest, false), |id| (id, true));
+    let uuid_shaped = id.len() == 36
+        && id.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase(),
+        });
+    uuid_shaped.then_some((id, guard))
+}
+
+fn create_error(error: TensorlakeError) -> Status {
+    match error {
+        TensorlakeError::Api { status, .. } if status.as_u16() == 409 => {
+            Status::already_exists("Tensorlake sandbox already exists")
+        }
+        other => Status::unavailable(other.to_string()),
+    }
 }
 
 /// Parse a Kubernetes-style CPU quantity (`2`, `1.5`, `500m`) into vCPUs.
@@ -390,36 +432,81 @@ impl TensorlakeComputeDriver {
         if self.records.lock().await.contains_key(&sandbox.id) {
             return Err(Status::already_exists("sandbox already exists"));
         }
+        let split = self.config.topology == Topology::Split;
+        // The VM that runs the guard needs the gateway and, with a tunnel,
+        // the Tensorlake hosts. Empty keeps Tensorlake's default internet.
         let allow_out = self.config.effective_allow_out();
-        let network = (!allow_out.is_empty()).then(|| NetworkPolicy {
+        let guard_network = (!allow_out.is_empty()).then(|| NetworkPolicy {
             allow_internet_access: false,
             allow_out,
             deny_out: Vec::new(),
         });
-        let name = tensorlake_name(&sandbox.id);
-        let request = CreateSandboxRequest {
-            image: Some(self.image_for(sandbox)),
-            resources: Some(resources),
-            timeout_secs: self.config.timeout_secs,
-            network,
-            name: Some(name.clone()),
-            wait: Some(false),
+        // The workload VM in the split topology gets no outbound path at
+        // all. Its connections travel over the boundary channel to the guard.
+        let workload_network = if split {
+            Some(NetworkPolicy::no_egress())
+        } else {
+            guard_network.clone()
         };
+        let name = tensorlake_name(&sandbox.id);
         let created = self
             .client
-            .create_sandbox(&request)
+            .create_sandbox(&CreateSandboxRequest {
+                image: Some(self.image_for(sandbox)),
+                resources: Some(resources),
+                timeout_secs: self.config.timeout_secs,
+                network: workload_network,
+                name: Some(name.clone()),
+                wait: Some(false),
+            })
             .await
-            .map_err(|error| match error {
-                TensorlakeError::Api { status, .. } if status.as_u16() == 409 => {
-                    Status::already_exists("Tensorlake sandbox already exists")
-                }
-                other => Status::unavailable(other.to_string()),
-            })?;
+            .map_err(create_error)?;
         info!(
             sandbox_id = %sandbox.id,
             tensorlake_sandbox_id = %created.sandbox_id,
             "Created Tensorlake sandbox"
         );
+        let guard_tensorlake_id = if split {
+            let guard = self
+                .client
+                .create_sandbox(&CreateSandboxRequest {
+                    image: Some(self.config.guard_image().to_string()),
+                    resources: Some(Resources {
+                        cpus: self.config.guard_cpus,
+                        memory_mb: self.config.guard_memory_mb,
+                        disk_mb: None,
+                    }),
+                    timeout_secs: self.config.timeout_secs,
+                    network: guard_network,
+                    name: Some(tensorlake_guard_name(&sandbox.id)),
+                    wait: Some(false),
+                })
+                .await;
+            match guard {
+                Ok(guard) => {
+                    info!(
+                        sandbox_id = %sandbox.id,
+                        tensorlake_sandbox_id = %guard.sandbox_id,
+                        "Created Tensorlake guard sandbox"
+                    );
+                    Some(guard.sandbox_id)
+                }
+                Err(error) => {
+                    // Never leave a workload VM without its guard.
+                    if let Err(cleanup) = self.client.delete_sandbox(&created.sandbox_id).await {
+                        warn!(
+                            sandbox_id = %sandbox.id,
+                            tensorlake_sandbox_id = %created.sandbox_id,
+                            %cleanup,
+                            "Failed to delete the workload VM after the guard VM create failed"
+                        );
+                    }
+                    return Err(create_error(error));
+                }
+            }
+        } else {
+            None
+        };
 
         // Keep secrets out of the stored record; only the provisioning task
         // sees the launch credentials.
@@ -432,9 +519,11 @@ impl TensorlakeComputeDriver {
             sandbox: stored,
             tensorlake_id: created.sandbox_id.clone(),
             tensorlake_name: name,
+            guard_tensorlake_id: guard_tensorlake_id.clone(),
             identity: Some(identity.clone()),
             phase: Phase::Pending,
             launcher_pid: None,
+            guard_launcher_pid: None,
         };
         self.records
             .lock()
@@ -447,7 +536,12 @@ impl TensorlakeComputeDriver {
         let sandbox = sandbox.clone();
         tokio::spawn(async move {
             if let Err(message) = driver
-                .provision(&sandbox, &created.sandbox_id, &identity)
+                .provision(
+                    &sandbox,
+                    &created.sandbox_id,
+                    guard_tensorlake_id.as_deref(),
+                    &identity,
+                )
                 .await
             {
                 warn!(sandbox_id = %sandbox.id, %message, "Tensorlake sandbox launch failed");
@@ -466,26 +560,92 @@ impl TensorlakeComputeDriver {
         Ok(())
     }
 
-    /// Wait for the VM, upload the launch bundle, and start the launcher.
+    /// Wait for the VMs, upload the launch bundles, and start the launchers.
     async fn provision(
         &self,
         sandbox: &DriverSandbox,
         tensorlake_id: &str,
+        guard_tensorlake_id: Option<&str>,
         identity: &ResolvedWorkloadIdentity,
     ) -> Result<(), String> {
         let started = Instant::now();
+        let Some(workload_info) = self
+            .wait_running(sandbox, tensorlake_id, "workload", started)
+            .await?
+        else {
+            return Ok(());
+        };
+        let guard_info = match guard_tensorlake_id {
+            Some(guard_id) => match self
+                .wait_running(sandbox, guard_id, "guard", started)
+                .await?
+            {
+                Some(info) => Some(info),
+                None => return Ok(()),
+            },
+            None => None,
+        };
+        self.set_phase(&sandbox.id, Phase::Launching).await;
+        self.publish_progress(&sandbox.id, LaunchProgress::VmRunning);
+        self.publish_progress(&sandbox.id, LaunchProgress::UploadingBundle);
+
+        let bundles = launch::build_launch_bundles(LaunchBundleInput {
+            sandbox,
+            config: &self.config,
+            tensorlake_sandbox_id: tensorlake_id,
+            guard_tensorlake_id,
+            identity,
+            gateway_ca_pem: self.gateway_ca_pem.as_deref().map(Vec::as_slice),
+        })?;
+        self.client
+            .write_file(&workload_info, launch::BUNDLE_UPLOAD_PATH, bundles.workload)
+            .await
+            .map_err(|error| format!("upload launch bundle: {error}"))?;
+        let guard_launcher_pid =
+            if let (Some(guard_info), Some(bundle)) = (&guard_info, bundles.guard) {
+                self.client
+                    .write_file(guard_info, launch::BUNDLE_UPLOAD_PATH, bundle)
+                    .await
+                    .map_err(|error| format!("upload guard launch bundle: {error}"))?;
+                self.publish_progress(&sandbox.id, LaunchProgress::StartingLauncher);
+                Some(self.start_launcher(sandbox, guard_info, "guard").await?)
+            } else {
+                self.publish_progress(&sandbox.id, LaunchProgress::StartingLauncher);
+                None
+            };
+        let launcher_pid = self
+            .start_launcher(sandbox, &workload_info, "workload")
+            .await?;
+        if let Some(record) = self.records.lock().await.get_mut(&sandbox.id) {
+            record.launcher_pid = Some(launcher_pid);
+            record.guard_launcher_pid = guard_launcher_pid;
+        }
+        self.set_phase(&sandbox.id, Phase::Running).await;
+        self.publish_progress(&sandbox.id, LaunchProgress::LauncherStarted);
+        Ok(())
+    }
+
+    /// Poll one VM until it runs. `Ok(None)` means the sandbox was deleted
+    /// meanwhile and provisioning should stop quietly.
+    async fn wait_running(
+        &self,
+        sandbox: &DriverSandbox,
+        tensorlake_id: &str,
+        role: &str,
+        started: Instant,
+    ) -> Result<Option<SandboxInfo>, String> {
         let mut last_pending_reason: Option<String> = None;
-        let info = loop {
+        loop {
             if !self.is_active(&sandbox.id).await {
-                return Ok(());
+                return Ok(None);
             }
             let info = self
                 .client
                 .get_sandbox(tensorlake_id)
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| format!("get Tensorlake {role} sandbox: {error}"))?;
             match info.status.as_str() {
-                "running" => break info,
+                "running" => return Ok(Some(info)),
                 "pending" => {
                     // Report a new pending reason once, not on every poll.
                     let reason = info
@@ -504,36 +664,31 @@ impl TensorlakeComputeDriver {
                 }
                 other => {
                     return Err(format!(
-                        "Tensorlake sandbox entered state '{other}' before launch{}",
+                        "Tensorlake {role} sandbox entered state '{other}' before launch{}",
                         failure_detail(&info)
                     ));
                 }
             }
             if started.elapsed() > PROVISION_TIMEOUT {
-                return Err("Tensorlake sandbox did not start within 10 minutes".into());
+                return Err(format!(
+                    "Tensorlake {role} sandbox did not start within 10 minutes"
+                ));
             }
             tokio::time::sleep(self.config.poll_interval).await;
-        };
-        self.set_phase(&sandbox.id, Phase::Launching).await;
-        self.publish_progress(&sandbox.id, LaunchProgress::VmRunning);
-        self.publish_progress(&sandbox.id, LaunchProgress::UploadingBundle);
+        }
+    }
 
-        let bundle = launch::build_launch_bundle(LaunchBundleInput {
-            sandbox,
-            config: &self.config,
-            tensorlake_sandbox_id: tensorlake_id,
-            identity,
-            gateway_ca_pem: self.gateway_ca_pem.as_deref().map(Vec::as_slice),
-        })?;
-        self.client
-            .write_file(&info, launch::BUNDLE_UPLOAD_PATH, bundle)
-            .await
-            .map_err(|error| format!("upload launch bundle: {error}"))?;
-        self.publish_progress(&sandbox.id, LaunchProgress::StartingLauncher);
+    /// Start the in-image launcher as root and return its PID.
+    async fn start_launcher(
+        &self,
+        sandbox: &DriverSandbox,
+        info: &SandboxInfo,
+        role: &str,
+    ) -> Result<i64, String> {
         let launcher = self
             .client
             .start_process(
-                &info,
+                info,
                 &StartProcessRequest {
                     command: launch::LAUNCHER_PATH.to_string(),
                     args: vec![launch::BUNDLE_UPLOAD_PATH.to_string()],
@@ -543,18 +698,15 @@ impl TensorlakeComputeDriver {
                 },
             )
             .await
-            .map_err(|error| format!("start OpenShell launcher: {error}"))?;
+            .map_err(|error| format!("start OpenShell {role} launcher: {error}"))?;
         info!(
             sandbox_id = %sandbox.id,
+            tensorlake_sandbox_id = %info.sandbox_id,
             launcher_pid = launcher.pid,
+            role,
             "Started OpenShell launcher in Tensorlake sandbox"
         );
-        if let Some(record) = self.records.lock().await.get_mut(&sandbox.id) {
-            record.launcher_pid = Some(launcher.pid);
-        }
-        self.set_phase(&sandbox.id, Phase::Running).await;
-        self.publish_progress(&sandbox.id, LaunchProgress::LauncherStarted);
-        Ok(())
+        Ok(launcher.pid)
     }
 
     pub async fn get_sandbox(&self, sandbox_id: &str) -> Option<DriverSandbox> {
@@ -578,7 +730,7 @@ impl TensorlakeComputeDriver {
     }
 
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, Status> {
-        let tensorlake_id = {
+        let (tensorlake_id, guard_tensorlake_id) = {
             let mut records = self.records.lock().await;
             let Some(record) = records.get_mut(sandbox_id) else {
                 return Ok(false);
@@ -587,14 +739,17 @@ impl TensorlakeComputeDriver {
             let record = record.clone();
             drop(records);
             self.emit_sandbox(&record);
-            record.tensorlake_id
+            (record.tensorlake_id, record.guard_tensorlake_id)
         };
-        let deleted = self
-            .client
-            .delete_sandbox(&tensorlake_id)
-            .await
-            .map_err(|error| Status::unavailable(error.to_string()))?;
-        if !deleted {
+        let mut remaining = false;
+        for id in std::iter::once(&tensorlake_id).chain(guard_tensorlake_id.as_ref()) {
+            remaining |= self
+                .client
+                .delete_sandbox(id)
+                .await
+                .map_err(|error| Status::unavailable(error.to_string()))?;
+        }
+        if !remaining {
             self.forget(sandbox_id).await;
         }
         Ok(true)
@@ -684,22 +839,14 @@ impl TensorlakeComputeDriver {
             .await
             .map_err(|error| format!("list Tensorlake sandboxes: {error}"))?;
         let mut records = self.records.lock().await;
-        for info in sandboxes {
-            let Some(sandbox_id) = info
-                .name
-                .as_deref()
-                .and_then(|name| name.strip_prefix(NAME_PREFIX))
-                .filter(|id| !id.is_empty())
-            else {
+        for (sandbox_id, workload, guard) in pair_by_name(&sandboxes) {
+            let Some(phase) = recovered_phase(workload, guard, self.config.topology) else {
                 continue;
             };
-            let phase = match observed_phase(&info) {
-                Some(Phase::Pending) => Phase::Failed {
-                    reason: "DriverRestarted".into(),
-                    message: "the Tensorlake driver restarted before this sandbox launched; delete and recreate it".into(),
-                },
-                Some(phase) => phase,
-                None => continue,
+            // A guard VM whose workload VM is gone is still recorded, under
+            // the workload's name, so that delete can remove it.
+            let Some(anchor) = workload.or(guard) else {
+                continue;
             };
             records.insert(
                 sandbox_id.to_string(),
@@ -708,11 +855,14 @@ impl TensorlakeComputeDriver {
                         id: sandbox_id.to_string(),
                         ..DriverSandbox::default()
                     },
-                    tensorlake_id: info.sandbox_id.clone(),
-                    tensorlake_name: info.name.clone().unwrap_or_default(),
+                    tensorlake_id: workload
+                        .map_or_else(|| anchor.sandbox_id.clone(), |info| info.sandbox_id.clone()),
+                    tensorlake_name: tensorlake_name(sandbox_id),
+                    guard_tensorlake_id: guard.map(|info| info.sandbox_id.clone()),
                     identity: None,
                     phase,
                     launcher_pid: None,
+                    guard_launcher_pid: None,
                 },
             );
         }
@@ -748,34 +898,103 @@ impl TensorlakeComputeDriver {
             .collect();
         for (sandbox_id, record) in records {
             let info = observed.get(&record.tensorlake_id);
-            match reconcile(&record.phase, info) {
+            let guard_vm = record
+                .guard_tensorlake_id
+                .as_ref()
+                .map_or(GuardVm::NotUsed, |id| {
+                    observed.get(id).map_or(GuardVm::Gone, GuardVm::Present)
+                });
+            match reconcile(&record.phase, info, guard_vm) {
                 Reconcile::Keep => {}
                 Reconcile::Forget => self.forget(&sandbox_id).await,
                 Reconcile::Set(next) => self.set_phase(&sandbox_id, next).await,
             }
-            if let (Some(info), Some(pid)) = (info, record.launcher_pid)
-                && record.phase == Phase::Running
-                && observed_phase(info) == Some(Phase::Running)
-            {
-                self.check_launcher(&sandbox_id, info, pid).await;
+            if record.phase != Phase::Running {
+                continue;
+            }
+            let launchers = [
+                (info, record.launcher_pid, "workload"),
+                (guard_vm.info(), record.guard_launcher_pid, "guard"),
+            ];
+            for (info, pid, role) in launchers {
+                if let (Some(info), Some(pid)) = (info, pid)
+                    && observed_phase(info) == Some(Phase::Running)
+                {
+                    self.check_launcher(&sandbox_id, info, pid, role).await;
+                }
             }
         }
         Ok(())
     }
 
-    /// Mark the sandbox failed when its launcher has stopped. Without the
+    /// Mark the sandbox failed when a launcher has stopped. Without the
     /// launcher the guard never connects, and the gateway would wait.
-    async fn check_launcher(&self, sandbox_id: &str, info: &SandboxInfo, pid: i64) {
+    async fn check_launcher(&self, sandbox_id: &str, info: &SandboxInfo, pid: i64, role: &str) {
         match self.client.get_process(info, pid).await {
             Ok(process) => {
-                if let Some(failed) = launcher_failure(&info.sandbox_id, process.as_ref()) {
-                    warn!(%sandbox_id, ?failed, "OpenShell launcher stopped");
+                if let Some(failed) = launcher_failure(&info.sandbox_id, process.as_ref(), role) {
+                    warn!(%sandbox_id, role, ?failed, "OpenShell launcher stopped");
                     self.set_phase(sandbox_id, failed).await;
                 }
             }
-            Err(error) => warn!(%sandbox_id, %error, "Tensorlake launcher status check failed"),
+            Err(error) => {
+                warn!(%sandbox_id, role, %error, "Tensorlake launcher status check failed");
+            }
         }
     }
+}
+
+/// Group the Tensorlake sandboxes this driver created by `OpenShell` sandbox
+/// ID: `(id, workload VM, guard VM)`.
+fn pair_by_name(
+    sandboxes: &[SandboxInfo],
+) -> Vec<(&str, Option<&SandboxInfo>, Option<&SandboxInfo>)> {
+    let mut pairs: std::collections::BTreeMap<&str, (Option<&SandboxInfo>, Option<&SandboxInfo>)> =
+        std::collections::BTreeMap::new();
+    for info in sandboxes {
+        let Some((sandbox_id, guard)) = info.name.as_deref().and_then(parse_tensorlake_name) else {
+            continue;
+        };
+        let pair = pairs.entry(sandbox_id).or_default();
+        if guard {
+            pair.1 = Some(info);
+        } else {
+            pair.0 = Some(info);
+        }
+    }
+    pairs
+        .into_iter()
+        .map(|(id, (workload, guard))| (id, workload, guard))
+        .collect()
+}
+
+/// Phase for a pair found after a driver restart. `None` means nothing is
+/// left to track.
+fn recovered_phase(
+    workload: Option<&SandboxInfo>,
+    guard: Option<&SandboxInfo>,
+    topology: Topology,
+) -> Option<Phase> {
+    let workload_phase = workload.and_then(observed_phase);
+    let guard_phase = guard.and_then(observed_phase);
+    let restarted = || Phase::Failed {
+        reason: "DriverRestarted".into(),
+        message:
+            "the Tensorlake driver restarted before this sandbox launched; delete and recreate it"
+                .into(),
+    };
+    let half = |what: &str| Phase::Failed {
+        reason: "PairIncomplete".into(),
+        message: format!("the {what} VM of this sandbox is gone; delete and recreate it"),
+    };
+    Some(match (workload_phase, guard_phase, topology) {
+        (None, None, _) => return None,
+        (Some(Phase::Pending), _, _) | (_, Some(Phase::Pending), _) => restarted(),
+        (None, Some(_), _) => half("workload"),
+        (Some(_), None, Topology::Split) => half("guard"),
+        (Some(Phase::Suspended), _, _) | (_, Some(Phase::Suspended), _) => Phase::Suspended,
+        (Some(phase), _, _) => phase,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -785,32 +1004,85 @@ enum Reconcile {
     Set(Phase),
 }
 
+/// What one poll saw of a sandbox's guard VM.
+#[derive(Debug, Clone, Copy)]
+enum GuardVm<'a> {
+    /// Combined topology: there is no guard VM.
+    NotUsed,
+    /// Split topology, but Tensorlake no longer lists the guard VM.
+    Gone,
+    Present(&'a SandboxInfo),
+}
+
+impl<'a> GuardVm<'a> {
+    fn info(self) -> Option<&'a SandboxInfo> {
+        match self {
+            Self::Present(info) => Some(info),
+            Self::NotUsed | Self::Gone => None,
+        }
+    }
+}
+
 /// Decide how one poll observation changes a record.
-fn reconcile(current: &Phase, info: Option<&SandboxInfo>) -> Reconcile {
-    match (current, info.and_then(observed_phase)) {
+fn reconcile(current: &Phase, workload: Option<&SandboxInfo>, guard: GuardVm<'_>) -> Reconcile {
+    let workload_phase = workload.and_then(observed_phase);
+    // `None` when the topology has no guard VM; `Some(None)` when it is gone.
+    let guard_phase = match guard {
+        GuardVm::NotUsed => None,
+        GuardVm::Gone => Some(None),
+        GuardVm::Present(info) => Some(observed_phase(info)),
+    };
+    let any_present = workload_phase.is_some() || matches!(guard_phase, Some(Some(_)));
+    match current {
         // Gone from Tensorlake while we delete it: finish the delete.
-        (Phase::Deleting, None) => Reconcile::Forget,
+        Phase::Deleting if !any_present => return Reconcile::Forget,
+        // Keep the current phase while a delete runs.
+        Phase::Deleting
         // The provisioning task owns launch progress and reports its own
         // failures.
-        (Phase::Pending | Phase::Launching, _)
-        // Keep the current phase while a delete runs.
-        | (Phase::Deleting, Some(_))
-        // A failed launch stays failed while the VM still exists. Nothing
+        | Phase::Pending
+        | Phase::Launching => return Reconcile::Keep,
+        // A failed launch stays failed while the VMs still exist. Nothing
         // will launch it again.
-        | (Phase::Failed { .. }, Some(Phase::Pending | Phase::Running)) => Reconcile::Keep,
-        (_, None) => Reconcile::Set(Phase::Failed {
+        Phase::Failed { .. }
+            if workload_phase
+                .as_ref()
+                .is_some_and(|phase| *phase != Phase::Suspended)
+                && guard_phase.as_ref().is_none_or(|phase| {
+                    phase
+                        .as_ref()
+                        .is_some_and(|phase| *phase != Phase::Suspended)
+                }) =>
+        {
+            return Reconcile::Keep;
+        }
+        _ => {}
+    }
+    let gone = |what: &str, info: Option<&SandboxInfo>| {
+        Reconcile::Set(Phase::Failed {
             reason: "TensorlakeTerminated".into(),
             message: format!(
-                "Tensorlake sandbox is no longer running{}",
+                "Tensorlake {what} sandbox is no longer running{}",
                 info.map(failure_detail).unwrap_or_default()
             ),
-        }),
-        (_, Some(next)) => Reconcile::Set(next),
+        })
+    };
+    match (workload_phase, guard_phase) {
+        (None, _) => gone("workload", workload),
+        (Some(_), Some(None)) => gone("guard", guard.info()),
+        (Some(Phase::Suspended), _) | (_, Some(Some(Phase::Suspended))) => {
+            Reconcile::Set(Phase::Suspended)
+        }
+        (Some(next), _) => Reconcile::Set(next),
     }
 }
 
 /// The failed phase for a launcher that is no longer running.
-fn launcher_failure(tensorlake_id: &str, process: Option<&ProcessInfo>) -> Option<Phase> {
+fn launcher_failure(
+    tensorlake_id: &str,
+    process: Option<&ProcessInfo>,
+    role: &str,
+) -> Option<Phase> {
     let outcome = match process {
         Some(process) if process.is_running() => return None,
         Some(process) => process.outcome(),
@@ -819,7 +1091,7 @@ fn launcher_failure(tensorlake_id: &str, process: Option<&ProcessInfo>) -> Optio
     Some(Phase::Failed {
         reason: "LauncherExited".into(),
         message: format!(
-            "the OpenShell launcher {outcome}; run `tl sbx logs {tensorlake_id}` for details"
+            "the OpenShell {role} launcher {outcome}; run `tl sbx logs {tensorlake_id}` for details"
         ),
     })
 }
@@ -1108,10 +1380,16 @@ mod tests {
     #[test]
     fn reconcile_leaves_launch_to_the_provisioning_task() {
         // A new record can be missing from a list that started before create.
-        assert_eq!(reconcile(&Phase::Pending, None), Reconcile::Keep);
-        assert_eq!(reconcile(&Phase::Launching, None), Reconcile::Keep);
         assert_eq!(
-            reconcile(&Phase::Pending, Some(&info("running"))),
+            reconcile(&Phase::Pending, None, GuardVm::NotUsed),
+            Reconcile::Keep
+        );
+        assert_eq!(
+            reconcile(&Phase::Launching, None, GuardVm::NotUsed),
+            Reconcile::Keep
+        );
+        assert_eq!(
+            reconcile(&Phase::Pending, Some(&info("running")), GuardVm::NotUsed),
             Reconcile::Keep
         );
     }
@@ -1123,29 +1401,172 @@ mod tests {
             message: "m".into(),
         };
         for status in ["pending", "running"] {
-            assert_eq!(reconcile(&failed, Some(&info(status))), Reconcile::Keep);
+            let vm = info(status);
+            assert_eq!(
+                reconcile(&failed, Some(&vm), GuardVm::NotUsed),
+                Reconcile::Keep
+            );
+            assert_eq!(
+                reconcile(&failed, Some(&vm), GuardVm::Present(&vm)),
+                Reconcile::Keep
+            );
         }
+        // Once a VM is gone, the failure reason follows the VM.
+        assert!(matches!(
+            reconcile(&failed, None, GuardVm::NotUsed),
+            Reconcile::Set(Phase::Failed { reason, .. }) if reason == "TensorlakeTerminated"
+        ));
     }
 
     #[test]
     fn reconcile_tracks_running_sandboxes() {
-        assert_eq!(reconcile(&Phase::Deleting, None), Reconcile::Forget);
         assert_eq!(
-            reconcile(&Phase::Deleting, Some(&info("running"))),
+            reconcile(&Phase::Deleting, None, GuardVm::NotUsed),
+            Reconcile::Forget
+        );
+        assert_eq!(
+            reconcile(&Phase::Deleting, Some(&info("running")), GuardVm::NotUsed),
             Reconcile::Keep
         );
         assert_eq!(
-            reconcile(&Phase::Running, Some(&info("suspended"))),
+            reconcile(&Phase::Running, Some(&info("suspended")), GuardVm::NotUsed),
             Reconcile::Set(Phase::Suspended)
         );
         assert_eq!(
-            reconcile(&Phase::Suspended, Some(&info("running"))),
+            reconcile(&Phase::Suspended, Some(&info("running")), GuardVm::NotUsed),
             Reconcile::Set(Phase::Running)
         );
         assert!(matches!(
-            reconcile(&Phase::Running, Some(&info("terminated"))),
+            reconcile(&Phase::Running, Some(&info("terminated")), GuardVm::NotUsed),
             Reconcile::Set(Phase::Failed { reason, .. }) if reason == "TensorlakeTerminated"
         ));
+    }
+
+    #[test]
+    fn reconcile_tracks_both_vms_of_a_split_sandbox() {
+        let running = info("running");
+        let suspended = info("suspended");
+        // Both present and running: keep running.
+        assert_eq!(
+            reconcile(&Phase::Running, Some(&running), GuardVm::Present(&running)),
+            Reconcile::Set(Phase::Running)
+        );
+        // Delete finishes only when both are gone.
+        assert_eq!(
+            reconcile(&Phase::Deleting, None, GuardVm::Present(&running)),
+            Reconcile::Keep
+        );
+        assert_eq!(
+            reconcile(&Phase::Deleting, None, GuardVm::Gone),
+            Reconcile::Forget
+        );
+        // A lost guard VM fails the sandbox and names the guard.
+        let Reconcile::Set(Phase::Failed { reason, message }) =
+            reconcile(&Phase::Running, Some(&running), GuardVm::Gone)
+        else {
+            panic!("a lost guard VM must fail the sandbox");
+        };
+        assert_eq!(reason, "TensorlakeTerminated");
+        assert!(message.contains("guard"));
+        // A suspended guard VM suspends the sandbox.
+        assert_eq!(
+            reconcile(
+                &Phase::Running,
+                Some(&running),
+                GuardVm::Present(&suspended)
+            ),
+            Reconcile::Set(Phase::Suspended)
+        );
+    }
+
+    fn named(name: &str, status: &str) -> SandboxInfo {
+        SandboxInfo {
+            sandbox_id: format!("id-{name}"),
+            name: Some(name.into()),
+            ..info(status)
+        }
+    }
+
+    const ID: &str = "fda3b8c8-4d1f-4c8e-a762-d863a24e0137";
+
+    #[test]
+    fn names_identify_guard_vms() {
+        assert_eq!(tensorlake_guard_name(ID), format!("openshell-{ID}-guard"));
+        assert_eq!(
+            parse_tensorlake_name(&format!("openshell-{ID}")),
+            Some((ID, false))
+        );
+        assert_eq!(
+            parse_tensorlake_name(&format!("openshell-{ID}-guard")),
+            Some((ID, true))
+        );
+        // The control sandbox and other operator sandboxes share the prefix.
+        assert_eq!(parse_tensorlake_name("openshell-control"), None);
+        assert_eq!(parse_tensorlake_name("openshell-control-split"), None);
+        assert_eq!(parse_tensorlake_name("openshell-"), None);
+        assert_eq!(parse_tensorlake_name("openshell--guard"), None);
+        assert_eq!(parse_tensorlake_name(&format!("other-{ID}")), None);
+    }
+
+    #[test]
+    fn recovery_pairs_vms_by_name() {
+        let (a, b, c) = (
+            "aaaaaaaa-0000-4000-8000-000000000001",
+            "bbbbbbbb-0000-4000-8000-000000000002",
+            "cccccccc-0000-4000-8000-000000000003",
+        );
+        let sandboxes = vec![
+            named(&format!("openshell-{a}"), "running"),
+            named(&format!("openshell-{a}-guard"), "running"),
+            named(&format!("openshell-{b}"), "running"),
+            named(&format!("openshell-{c}-guard"), "running"),
+            named("openshell-control", "running"),
+            named("unrelated", "running"),
+        ];
+        let pairs = pair_by_name(&sandboxes);
+        assert_eq!(pairs.len(), 3);
+        let (id, workload, guard) = pairs[0];
+        assert_eq!(id, a);
+        assert_eq!(workload.unwrap().sandbox_id, format!("id-openshell-{a}"));
+        assert_eq!(guard.unwrap().sandbox_id, format!("id-openshell-{a}-guard"));
+        assert_eq!(
+            recovered_phase(workload, guard, Topology::Split),
+            Some(Phase::Running)
+        );
+        // A workload VM without its guard: fine in the combined topology,
+        // broken in the split topology.
+        let (_, workload, guard) = pairs[1];
+        assert_eq!(
+            recovered_phase(workload, guard, Topology::Combined),
+            Some(Phase::Running)
+        );
+        assert!(matches!(
+            recovered_phase(workload, guard, Topology::Split),
+            Some(Phase::Failed { reason, .. }) if reason == "PairIncomplete"
+        ));
+        // A guard VM without its workload is recorded so delete can reach it.
+        let (_, workload, guard) = pairs[2];
+        assert!(matches!(
+            recovered_phase(workload, guard, Topology::Split),
+            Some(Phase::Failed { reason, .. }) if reason == "PairIncomplete"
+        ));
+        // A pending VM at restart cannot finish launching.
+        assert!(matches!(
+            recovered_phase(
+                Some(&named("openshell-d", "running")),
+                Some(&named("openshell-d-guard", "pending")),
+                Topology::Split
+            ),
+            Some(Phase::Failed { reason, .. }) if reason == "DriverRestarted"
+        ));
+        assert_eq!(
+            recovered_phase(
+                Some(&named("openshell-e", "terminated")),
+                None,
+                Topology::Split
+            ),
+            None
+        );
     }
 
     fn process(status: &str, exit_code: Option<i64>) -> ProcessInfo {
@@ -1158,18 +1579,18 @@ mod tests {
     #[test]
     fn launcher_failure_reports_stopped_launchers() {
         assert_eq!(
-            launcher_failure("tl1", Some(&process("running", None))),
+            launcher_failure("tl1", Some(&process("running", None)), "workload"),
             None
         );
         let Some(Phase::Failed { reason, message }) =
-            launcher_failure("tl1", Some(&process("exited", Some(1))))
+            launcher_failure("tl1", Some(&process("exited", Some(1))), "guard")
         else {
             panic!("an exited launcher must fail the sandbox");
         };
         assert_eq!(reason, "LauncherExited");
-        assert!(message.contains("exited with status 1"));
+        assert!(message.contains("guard launcher exited with status 1"));
         assert!(message.contains("tl sbx logs tl1"));
-        assert!(launcher_failure("tl1", None).is_some());
+        assert!(launcher_failure("tl1", None, "workload").is_some());
     }
 
     #[test]
