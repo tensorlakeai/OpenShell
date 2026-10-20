@@ -32,10 +32,6 @@ that carries the guard's connection to the workload VM. Every connection the
 agent makes travels over that channel to the guard, and the guard applies the
 policy. The agent's VM never holds a credential.
 
-Set `--topology combined` to run both in one VM. That halves the VM count but
-puts the credentials in the same kernel as the agent, so use it with test
-credentials only.
-
 The guard dials the gateway from inside Tensorlake. The gateway must therefore
 be reachable from the internet, or at least from Tensorlake. A gateway on a
 laptop behind NAT does not work. The supported setup runs the gateway and the
@@ -149,7 +145,6 @@ socket_path = "/run/openshell/tensorlake.sock"
 | `--grpc-endpoint` | `OPENSHELL_GRPC_ENDPOINT` | Required. The URL guards dial. |
 | `--gateway-tls-ca` | `OPENSHELL_TENSORLAKE_GATEWAY_TLS_CA` | Required for `https`. Guards trust only this bundle. |
 | `--sandbox-image` | `OPENSHELL_SANDBOX_IMAGE` | Required. A registered Tensorlake image with the OpenShell runtime, the Tensorlake CLI, and the launcher. |
-| `--topology` | `OPENSHELL_TENSORLAKE_TOPOLOGY` | `split`. `combined` runs guard and workload in one VM. |
 | `--guard-image` | `OPENSHELL_TENSORLAKE_GUARD_IMAGE` | The sandbox image. |
 | `--guard-cpus`, `--guard-memory-mb` | `OPENSHELL_TENSORLAKE_GUARD_*` | 1, 1024 |
 | `--cpus`, `--memory-mb`, `--disk-mb` | `OPENSHELL_TENSORLAKE_*` | 2, 4096, Tensorlake default |
@@ -186,9 +181,8 @@ replace a published version. Publish a new one.
 
 ## Trust Model
 
-In the split topology the agent runs in a VM that holds only its own channel
-key. The gateway session, the provider credentials, and the policy live in the
-guard VM. An agent that gains root in its VM gets no credential, and still has
+The agent runs in a VM that holds only its own channel key. The gateway
+session, the provider credentials, and the policy live in the guard VM. An agent that gains root in its VM gets no credential, and still has
 no outbound path, because the Tensorlake network policy blocks every
 connection that does not go through the guard. This is the same separation
 the Kubernetes driver gives with a guard pod and a NetworkPolicy.
@@ -201,9 +195,6 @@ Two things to know:
 - Anyone with access to that project can run `tl sbx exec --user root` in a
   guard VM and read its credentials. Project access is the trust boundary.
 
-In the combined topology a root user in the one VM can read the guard's
-credentials. Use it with test credentials only.
-
 ## Limits
 
 - Stop and start are not supported. Delete the sandbox instead.
@@ -215,8 +206,8 @@ credentials. Use it with test credentials only.
 - After a driver restart, sandboxes that had not finished launching are
   reported as failed. Running sandboxes are recovered from the saved
   requests in `--state-dir`. Keep that directory with the gateway database.
-- The split topology uses two Tensorlake VMs per sandbox. The guard VM
-  defaults to 1 vCPU and 1 GiB.
+- Each sandbox uses two Tensorlake VMs. The guard VM defaults to 1 vCPU and
+  1 GiB.
 
 For build details, the test runbook, and the design notes, see the
 [driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-tensorlake/README.md).

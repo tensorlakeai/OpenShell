@@ -19,9 +19,6 @@
 #   guard     Start a `tl sbx tunnel` to the workload VM and the guard
 #             (openshell-supervisor), as two unprivileged identities that
 #             cannot read each other's files.
-#   combined  Start both in this VM. The workload runs in a network
-#             namespace that has only loopback, so its only path out is the
-#             channel to the guard. Test credentials only.
 #
 # The script extracts the bundle with the owners and modes the driver set,
 # deletes it, starts the role's processes, and stays in the foreground. It
@@ -65,7 +62,7 @@ tar --extract --file "$BUNDLE" --directory / --same-owner --same-permissions --n
 rm -f "$BUNDLE"
 
 # Read launch parameters (KEY=VALUE, numeric values and absolute paths).
-ROLE=combined
+ROLE=""
 WORKLOAD_UID="" WORKLOAD_GID="" SUPERVISOR_UID="" SUPERVISOR_GID="" TUNNEL_UID="" TUNNEL_GID=""
 FORWARDER_UID="" FORWARDER_GID="" WORKLOAD_LISTEN_PORT="" WORKLOAD_FORWARD_PORT=""
 WORKSPACE="" SUPERVISOR_RUN_DIR="" TUNNEL_RUN_DIR=""
@@ -110,11 +107,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Workload runtime, in private network, mount, and PID namespaces. $1 is
-# "loopback" for a network namespace with only loopback (combined role: the
-# guard is in this VM and uses a Unix socket), or "veth" for a namespace
-# that also has one veth link to this VM (workload role: the guard connects
-# over TCP through the forwarder). Either way the resolver points at the
+# Workload runtime, in private network, mount, and PID namespaces. The
+# network namespace has loopback and one veth link to this VM, over which
+# the guard connects through the forwarder. The resolver points at the
 # sandbox runtime's DNS relay, and unprivileged processes may bind low ports
 # so the relay can take port 53.
 #
@@ -123,7 +118,6 @@ trap cleanup EXIT
 # a connecting process's ancestors up to the namespace init; without the
 # namespace it would reach this root-owned script and fail.
 start_workload() {
-    local network="$1"
     require_numeric "$WORKLOAD_UID" "$WORKLOAD_GID"
     require_absolute "$WORKSPACE"
     install -d -m 0755 "$WORKSPACE"
@@ -133,23 +127,17 @@ start_workload() {
     install -d -m 0755 -o "$WORKLOAD_UID" -g "$WORKLOAD_GID" /run/openshell-supervisor-ca
     printf 'nameserver 127.0.0.53\noptions timeout:2 attempts:2\n' >"$WORKLOAD_RESOLV_CONF"
     chmod 0644 "$WORKLOAD_RESOLV_CONF"
-    local -a enter
-    local -a unshare_common=(--pid --fork --kill-child --mount-proc --mount --propagation private)
-    if [ "$network" = veth ]; then
-        ip netns add "$WORKLOAD_NETNS"
-        ip link add osfw0 type veth peer name osfw1
-        ip link set osfw1 netns "$WORKLOAD_NETNS"
-        ip addr add "$VETH_HOST_ADDR/30" dev osfw0
-        ip link set osfw0 up
-        ip -n "$WORKLOAD_NETNS" addr add "$VETH_WORKLOAD_ADDR/30" dev osfw1
-        ip -n "$WORKLOAD_NETNS" link set osfw1 up
-        ip -n "$WORKLOAD_NETNS" link set lo up
-        enter=(ip netns exec "$WORKLOAD_NETNS" unshare "${unshare_common[@]}" --)
-    else
-        enter=(unshare --net "${unshare_common[@]}" --)
-    fi
-    log "starting workload runtime as ${WORKLOAD_UID}:${WORKLOAD_GID} (${network} network)"
-    "${enter[@]}" /bin/bash -euc '
+    ip netns add "$WORKLOAD_NETNS"
+    ip link add osfw0 type veth peer name osfw1
+    ip link set osfw1 netns "$WORKLOAD_NETNS"
+    ip addr add "$VETH_HOST_ADDR/30" dev osfw0
+    ip link set osfw0 up
+    ip -n "$WORKLOAD_NETNS" addr add "$VETH_WORKLOAD_ADDR/30" dev osfw1
+    ip -n "$WORKLOAD_NETNS" link set osfw1 up
+    ip -n "$WORKLOAD_NETNS" link set lo up
+    log "starting workload runtime as ${WORKLOAD_UID}:${WORKLOAD_GID}"
+    ip netns exec "$WORKLOAD_NETNS" unshare --pid --fork --kill-child --mount-proc \
+        --mount --propagation private -- /bin/bash -euc '
         ip link set lo up
         echo 0 >/proc/sys/net/ipv4/ip_unprivileged_port_start
         mount --bind "$1" /etc/resolv.conf
@@ -210,12 +198,8 @@ start_tunnel() {
 }
 
 case "$ROLE" in
-    combined)
-        start_workload loopback
-        start_guard
-        ;;
     workload)
-        start_workload veth
+        start_workload
         start_forwarder
         ;;
     guard)

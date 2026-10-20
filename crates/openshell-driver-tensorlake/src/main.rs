@@ -12,7 +12,6 @@ use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_tensorlake::config::{
     DEFAULT_API_URL, DEFAULT_CPUS, DEFAULT_GUARD_CPUS, DEFAULT_GUARD_MEMORY_MB, DEFAULT_MEMORY_MB,
-    Topology,
 };
 use openshell_driver_tensorlake::{
     ComputeDriverService, TensorlakeComputeConfig, TensorlakeComputeDriver,
@@ -62,12 +61,6 @@ struct Args {
     /// Registered Tensorlake image with the `OpenShell` runtime and launcher.
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE")]
     sandbox_image: String,
-
-    /// Where the guard runs. `split` puts it in its own VM and reaches the
-    /// workload VM through a Tensorlake tunnel, so credentials never enter
-    /// the workload VM. `combined` shares one VM; test credentials only.
-    #[arg(long, env = "OPENSHELL_TENSORLAKE_TOPOLOGY", default_value = "split")]
-    topology: Topology,
 
     /// Registered Tensorlake image for guard VMs. Defaults to the sandbox
     /// image, which contains the guard and the Tensorlake CLI.
@@ -149,7 +142,6 @@ async fn main() -> Result<()> {
             .collect(),
         poll_interval: Duration::from_secs(args.poll_interval_secs.max(1)),
         log_level: args.log_level,
-        topology: args.topology,
         guard_image: args.guard_image,
         guard_cpus: args.guard_cpus,
         guard_memory_mb: args.guard_memory_mb,

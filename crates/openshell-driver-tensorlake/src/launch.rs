@@ -14,14 +14,11 @@
 //! - `/.openshell/tunnel/*` belongs to the tunnel identity (mode 0700). It
 //!   holds the Tensorlake key the guard VM's tunnel authenticates with.
 //!
-//! Split topology (default): the workload VM gets the channel files and
-//! listens on a TLS port. The guard VM gets the supervisor and tunnel files;
-//! its tunnel dials the workload VM's port on loopback. The workload VM has
-//! no outbound network at all (a Tensorlake network policy), so the only path
-//! out is the authenticated boundary channel.
-//!
-//! Combined topology: one VM gets both sides. The launcher starts the
-//! workload in a network namespace that has only loopback.
+//! The workload VM gets the channel files and listens on a TLS port. The
+//! guard VM gets the supervisor and tunnel files; its tunnel dials the
+//! workload VM's port on loopback. The workload VM has no outbound network
+//! at all (a Tensorlake network policy), so the only path out is the
+//! authenticated boundary channel.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -64,7 +61,6 @@ pub const FORWARDER_UID: u32 = 65_533;
 pub const FORWARDER_GID: u32 = 65_533;
 
 const WORKSPACE: &str = "/sandbox";
-const SOCKET_PATH: &str = "/.openshell/channel/sandbox/control.sock";
 const BOOTSTRAP_PATH: &str = "/.openshell/channel/sandbox/bootstrap.json";
 const SERVER_CERT_PATH: &str = "/.openshell/channel/sandbox/server.crt";
 const SERVER_KEY_PATH: &str = "/.openshell/channel/sandbox/server.key";
@@ -86,8 +82,6 @@ const TUNNEL_RUN_DIR: &str = "/run/openshell-tunnel";
 /// Which processes a launch bundle starts in its VM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    /// Workload and guard in one VM.
-    Combined,
     /// Only `openshell-sandbox`, listening for a remote guard.
     Workload,
     /// Only the tunnel and `openshell-supervisor`.
@@ -97,7 +91,6 @@ pub enum Role {
 impl Role {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::Combined => "combined",
             Self::Workload => "workload",
             Self::Guard => "guard",
         }
@@ -158,19 +151,16 @@ pub fn resolve_identity(
 }
 
 /// Evidence for the outer fence the driver requested. The driver cannot
-/// inspect the VM, so the evidence names the recipe.
-///
-/// Split: the workload runs in a network namespace whose only link leads to
-/// the tunnel forwarder in a VM that has internet access off and an empty
-/// allow list. Combined: a loopback-only network namespace has no route
-/// out. Either way egress needs a mediated decision, revocation takes effect
-/// at the guard, and guard loss leaves the workload without a path.
+/// inspect the VM, so the evidence names the recipe: the workload runs in a
+/// network namespace whose only link leads to the tunnel forwarder, in a VM
+/// that has internet access off and an empty allow list. Egress needs a
+/// mediated decision, revocation takes effect at the guard, and guard loss
+/// leaves the workload without a path.
 #[derive(Serialize)]
 struct TensorlakeOuterFenceEvidence<'a> {
     topology: &'static str,
     tensorlake_sandbox_id: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    guard_tensorlake_sandbox_id: Option<&'a str>,
+    guard_tensorlake_sandbox_id: &'a str,
     workload_network: &'static str,
     launcher: &'static str,
 }
@@ -178,21 +168,17 @@ struct TensorlakeOuterFenceEvidence<'a> {
 /// Bind the launch recipe to one generation as provisioning evidence.
 fn provisioning_evidence(
     tensorlake_sandbox_id: &str,
-    guard_tensorlake_sandbox_id: Option<&str>,
+    guard_tensorlake_sandbox_id: &str,
     generation: &str,
 ) -> Result<ProvisioningEvidence, String> {
-    if tensorlake_sandbox_id.is_empty() || guard_tensorlake_sandbox_id == Some("") {
+    if tensorlake_sandbox_id.is_empty() || guard_tensorlake_sandbox_id.is_empty() {
         return Err("Tensorlake sandbox ID is required for provisioning evidence".to_string());
     }
-    let (topology, workload_network) = match guard_tensorlake_sandbox_id {
-        Some(_) => ("split", "private-netns-veth-to-forwarder-no-egress"),
-        None => ("combined", "private-loopback-only"),
-    };
     let evidence = TensorlakeOuterFenceEvidence {
-        topology,
+        topology: "split",
         tensorlake_sandbox_id,
         guard_tensorlake_sandbox_id,
-        workload_network,
+        workload_network: "private-netns-veth-to-forwarder-no-egress",
         launcher: LAUNCHER_PATH,
     };
     let encoded = serde_json::to_vec(&evidence).map_err(invalid)?;
@@ -323,10 +309,10 @@ fn nul_list<I: IntoIterator<Item = String>>(items: I) -> Vec<u8> {
 pub struct LaunchBundleInput<'a> {
     pub sandbox: &'a DriverSandbox,
     pub config: &'a TensorlakeComputeConfig,
-    /// The workload VM (split) or the only VM (combined).
+    /// The workload VM.
     pub tensorlake_sandbox_id: &'a str,
-    /// The guard VM. `None` builds the combined bundle.
-    pub guard_tensorlake_id: Option<&'a str>,
+    /// The guard VM.
+    pub guard_tensorlake_id: &'a str,
     pub identity: &'a ResolvedWorkloadIdentity,
     pub gateway_ca_pem: Option<&'a [u8]>,
 }
@@ -334,11 +320,10 @@ pub struct LaunchBundleInput<'a> {
 /// The tar archives for one sandbox generation. Paths are relative to `/`.
 #[derive(Debug)]
 pub struct LaunchBundles {
-    /// Uploaded to the workload VM, or to the only VM in the combined
-    /// topology, where it also carries the guard files.
+    /// Uploaded to the workload VM.
     pub workload: Vec<u8>,
-    /// Uploaded to the guard VM. `None` in the combined topology.
-    pub guard: Option<Vec<u8>>,
+    /// Uploaded to the guard VM.
+    pub guard: Vec<u8>,
 }
 
 /// Build the launch bundles.
@@ -381,9 +366,10 @@ pub fn build_launch_bundles(input: LaunchBundleInput<'_>) -> Result<LaunchBundle
             identity.resource_digest.clone(),
         ),
     ]);
-    if let Some(guard) = guard_tensorlake_id {
-        resource_claims.insert("tensorlake.guard_sandbox_id".to_string(), guard.to_string());
-    }
+    resource_claims.insert(
+        "tensorlake.guard_sandbox_id".to_string(),
+        guard_tensorlake_id.to_string(),
+    );
     let verification_keys = launch_authentication
         .verification_keys
         .iter()
@@ -404,30 +390,16 @@ pub fn build_launch_bundles(input: LaunchBundleInput<'_>) -> Result<LaunchBundle
     // The TLS listener must not bind loopback, because workload sockets share
     // it. `0.0.0.0` also accepts the tunnel's connection, which arrives on
     // loopback; the sandbox runtime protects the port from workload sockets.
-    let (listener, transport) = if guard_tensorlake_id.is_some() {
-        (
-            BoundaryListener::TlsTcp {
-                address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), WORKLOAD_LISTEN_PORT),
-                tls: server_tls,
-            },
-            SandboxTransport::Tcp {
-                authority: format!("{tensorlake_sandbox_id}:{WORKLOAD_LISTEN_PORT}"),
-                addresses: vec![SocketAddr::new(
-                    IpAddr::V4(Ipv4Addr::LOCALHOST),
-                    GUARD_TUNNEL_PORT,
-                )],
-            },
-        )
-    } else {
-        (
-            BoundaryListener::Unix {
-                socket_path: PathBuf::from(SOCKET_PATH),
-                tls: server_tls,
-            },
-            SandboxTransport::Unix {
-                socket_path: PathBuf::from(SOCKET_PATH),
-            },
-        )
+    let listener = BoundaryListener::TlsTcp {
+        address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), WORKLOAD_LISTEN_PORT),
+        tls: server_tls,
+    };
+    let transport = SandboxTransport::Tcp {
+        authority: format!("{tensorlake_sandbox_id}:{WORKLOAD_LISTEN_PORT}"),
+        addresses: vec![SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            GUARD_TUNNEL_PORT,
+        )],
     };
     let boundary = BoundaryConfig {
         boundary_id: sandbox.id.clone(),
@@ -469,25 +441,16 @@ pub fn build_launch_bundles(input: LaunchBundleInput<'_>) -> Result<LaunchBundle
     let mut workload_archive = Archive::default();
     workload_archive.directory(".openshell", 0o755, ROOT)?;
     add_workload_files(&mut workload_archive, identity, &boundary, &tls)?;
-    if guard_tensorlake_id.is_some() {
-        add_params(&mut workload_archive, Role::Workload, identity)?;
-        let mut guard_archive = Archive::default();
-        guard_archive.directory(".openshell", 0o755, ROOT)?;
-        add_guard_files(&mut guard_archive, &guard_files)?;
-        add_tunnel_files(&mut guard_archive, config, tensorlake_sandbox_id)?;
-        add_params(&mut guard_archive, Role::Guard, identity)?;
-        Ok(LaunchBundles {
-            workload: workload_archive.finish()?,
-            guard: Some(guard_archive.finish()?),
-        })
-    } else {
-        add_guard_files(&mut workload_archive, &guard_files)?;
-        add_params(&mut workload_archive, Role::Combined, identity)?;
-        Ok(LaunchBundles {
-            workload: workload_archive.finish()?,
-            guard: None,
-        })
-    }
+    add_params(&mut workload_archive, Role::Workload, identity)?;
+    let mut guard_archive = Archive::default();
+    guard_archive.directory(".openshell", 0o755, ROOT)?;
+    add_guard_files(&mut guard_archive, &guard_files)?;
+    add_tunnel_files(&mut guard_archive, config, tensorlake_sandbox_id)?;
+    add_params(&mut guard_archive, Role::Guard, identity)?;
+    Ok(LaunchBundles {
+        workload: workload_archive.finish()?,
+        guard: guard_archive.finish()?,
+    })
 }
 
 const ROOT: Owner = Owner::new(0, 0);
@@ -634,35 +597,18 @@ fn add_params(
 ) -> Result<(), String> {
     use std::fmt::Write as _;
     let mut params = format!("ROLE={}\nWORKSPACE={WORKSPACE}\n", role.as_str());
-    if matches!(role, Role::Combined | Role::Workload) {
-        writeln!(
+    match role {
+        Role::Workload => writeln!(
             params,
-            "WORKLOAD_UID={}\nWORKLOAD_GID={}",
+            "WORKLOAD_UID={}\nWORKLOAD_GID={}\nFORWARDER_UID={FORWARDER_UID}\nFORWARDER_GID={FORWARDER_GID}\nWORKLOAD_LISTEN_PORT={WORKLOAD_LISTEN_PORT}\nWORKLOAD_FORWARD_PORT={WORKLOAD_FORWARD_PORT}",
             identity.uid, identity.gid
-        )
-        .expect("writing to a String cannot fail");
-    }
-    if matches!(role, Role::Combined | Role::Guard) {
-        writeln!(
+        ),
+        Role::Guard => writeln!(
             params,
-            "SUPERVISOR_UID={SUPERVISOR_UID}\nSUPERVISOR_GID={SUPERVISOR_GID}\nSUPERVISOR_RUN_DIR={SUPERVISOR_RUN_DIR}"
-        )
-        .expect("writing to a String cannot fail");
+            "SUPERVISOR_UID={SUPERVISOR_UID}\nSUPERVISOR_GID={SUPERVISOR_GID}\nSUPERVISOR_RUN_DIR={SUPERVISOR_RUN_DIR}\nTUNNEL_UID={TUNNEL_UID}\nTUNNEL_GID={TUNNEL_GID}\nTUNNEL_RUN_DIR={TUNNEL_RUN_DIR}"
+        ),
     }
-    if role == Role::Workload {
-        writeln!(
-            params,
-            "FORWARDER_UID={FORWARDER_UID}\nFORWARDER_GID={FORWARDER_GID}\nWORKLOAD_LISTEN_PORT={WORKLOAD_LISTEN_PORT}\nWORKLOAD_FORWARD_PORT={WORKLOAD_FORWARD_PORT}"
-        )
-        .expect("writing to a String cannot fail");
-    }
-    if role == Role::Guard {
-        writeln!(
-            params,
-            "TUNNEL_UID={TUNNEL_UID}\nTUNNEL_GID={TUNNEL_GID}\nTUNNEL_RUN_DIR={TUNNEL_RUN_DIR}"
-        )
-        .expect("writing to a String cannot fail");
-    }
+    .expect("writing to a String cannot fail");
     archive.directory(".openshell/launch", 0o700, ROOT)?;
     archive.file(LAUNCH_PARAMS_PATH, 0o600, ROOT, params.as_bytes())
 }
@@ -773,16 +719,14 @@ mod tests {
 
     #[test]
     fn provisioning_evidence_binds_generation() {
-        let evidence = provisioning_evidence("tl-1", None, "gen-1").unwrap();
+        let evidence = provisioning_evidence("tl-1", "tl-1-guard", "gen-1").unwrap();
         assert!(evidence.validate("gen-1").is_ok());
         assert!(evidence.validate("gen-2").is_err());
-        let other = provisioning_evidence("tl-2", None, "gen-1").unwrap();
+        let other = provisioning_evidence("tl-2", "tl-2-guard", "gen-1").unwrap();
         assert_ne!(evidence.evidence_digest, other.evidence_digest);
-        assert!(provisioning_evidence("", None, "gen-1").is_err());
-        assert!(provisioning_evidence("tl-1", None, "").is_err());
-        assert!(provisioning_evidence("tl-1", Some(""), "gen-1").is_err());
-        let split = provisioning_evidence("tl-1", Some("tl-1-guard"), "gen-1").unwrap();
-        assert_ne!(split.evidence_digest, evidence.evidence_digest);
+        assert!(provisioning_evidence("", "tl-1-guard", "gen-1").is_err());
+        assert!(provisioning_evidence("tl-1", "", "gen-1").is_err());
+        assert!(provisioning_evidence("tl-1", "tl-1-guard", "").is_err());
     }
 
     #[test]
@@ -808,7 +752,7 @@ mod tests {
             sandbox: &sandbox,
             config: &config,
             tensorlake_sandbox_id: "tl-1",
-            guard_tensorlake_id: None,
+            guard_tensorlake_id: "tl-1-guard",
             identity: &identity,
             gateway_ca_pem: None,
         });
@@ -880,60 +824,6 @@ mod tests {
     }
 
     #[test]
-    fn combined_bundle_separates_workload_and_guard_material() {
-        let sandbox = launch_sandbox();
-        let identity = resolve_identity(&sandbox, "img").unwrap();
-        let config = crate::config::tests::test_config();
-        let bundles = build_launch_bundles(LaunchBundleInput {
-            sandbox: &sandbox,
-            config: &config,
-            tensorlake_sandbox_id: "tl-1",
-            guard_tensorlake_id: None,
-            identity: &identity,
-            gateway_ca_pem: Some(b"ca"),
-        })
-        .unwrap();
-        assert!(bundles.guard.is_none());
-        let entries = read_entries(&bundles.workload);
-
-        // Workload side: bootstrap and boundary key only, owned by the workload.
-        let (mode, uid, bootstrap) = &entries[BOOTSTRAP_PATH.trim_start_matches('/')];
-        assert_eq!((*mode, *uid), (0o600, 1000));
-        let bootstrap = String::from_utf8_lossy(bootstrap);
-        assert!(bootstrap.contains("\"FOO\""));
-        assert!(!bootstrap.contains("gateway.token.value"));
-        assert!(!bootstrap.contains("sandbox.jwt.value"));
-
-        // Guard side: credentials owned by the guard identity.
-        for path in [AUTH_BUNDLE_PATH, SANDBOX_TOKEN_PATH, GATEWAY_CA_PATH] {
-            let (mode, uid, _) = &entries[path.trim_start_matches('/')];
-            assert_eq!((*mode, *uid), (0o600, u64::from(SUPERVISOR_UID)), "{path}");
-        }
-        let (mode, uid, _) = &entries[SUPERVISOR_DIR.trim_start_matches('/')];
-        assert_eq!((*mode, *uid), (0o700, u64::from(SUPERVISOR_UID)));
-
-        let (_, _, env) = &entries[SUPERVISOR_ENV_PATH.trim_start_matches('/')];
-        let env = String::from_utf8_lossy(env);
-        assert!(env.contains("OPENSHELL_ENDPOINT=https://gateway.example.com:8080\0"));
-        assert!(env.contains(&format!("OPENSHELL_TLS_CA={GATEWAY_CA_PATH}\0")));
-        assert!(env.contains(&format!(
-            "OPENSHELL_SANDBOX_TOKEN_FILE={SANDBOX_TOKEN_PATH}\0"
-        )));
-        assert!(env.contains("OPENSHELL_NETWORK_RUNTIME_CAPABILITIES=\0"));
-        assert!(!env.contains("sandbox.jwt.value"));
-
-        let (_, _, params) = &entries[LAUNCH_PARAMS_PATH.trim_start_matches('/')];
-        let params = String::from_utf8_lossy(params);
-        assert!(params.contains("ROLE=combined\n"));
-        assert!(params.contains("WORKLOAD_UID=1000\n"));
-        assert!(params.contains("SUPERVISOR_UID=65534\n"));
-        assert!(!params.contains("TUNNEL_UID"));
-        assert!(!entries.contains_key(TUNNEL_ENV_PATH.trim_start_matches('/')));
-        let bootstrap = String::from_utf8_lossy(&entry(&entries, BOOTSTRAP_PATH).2);
-        assert!(bootstrap.contains(SOCKET_PATH));
-    }
-
-    #[test]
     fn split_bundles_keep_every_secret_out_of_the_workload_vm() {
         let sandbox = launch_sandbox();
         let identity = resolve_identity(&sandbox, "img").unwrap();
@@ -944,7 +834,7 @@ mod tests {
             sandbox: &sandbox,
             config: &config,
             tensorlake_sandbox_id: "tl-1",
-            guard_tensorlake_id: Some("tl-1-guard"),
+            guard_tensorlake_id: "tl-1-guard",
             identity: &identity,
             gateway_ca_pem: Some(b"ca"),
         })
@@ -984,7 +874,7 @@ mod tests {
 
         // Guard VM: credentials for the guard, the key for the tunnel, no
         // channel server key.
-        let guard = read_entries(bundles.guard.as_deref().unwrap());
+        let guard = read_entries(&bundles.guard);
         assert!(!guard.contains_key(SERVER_KEY_PATH.trim_start_matches('/')));
         assert!(!guard.contains_key(BOOTSTRAP_PATH.trim_start_matches('/')));
         let descriptor = String::from_utf8_lossy(&entry(&guard, RUNTIME_DESCRIPTOR_PATH).2);

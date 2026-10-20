@@ -18,46 +18,12 @@ pub const DEFAULT_MEMORY_MB: i64 = 4096;
 /// Default status poll interval. Tensorlake has no watch API.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Default vCPU count for a guard VM in the split topology.
+/// Default vCPU count for a guard VM.
 pub const DEFAULT_GUARD_CPUS: f64 = 1.0;
 
-/// Default memory in MiB for a guard VM in the split topology. The guard
-/// uses about 32 MiB and the tunnel about 15 MiB.
+/// Default memory in MiB for a guard VM. The guard uses about 32 MiB and
+/// the tunnel about 15 MiB.
 pub const DEFAULT_GUARD_MEMORY_MB: i64 = 1024;
-
-/// Where the guard runs relative to the workload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Topology {
-    /// The guard runs in its own Tensorlake VM and reaches the workload VM
-    /// through a Tensorlake tunnel. Credentials never enter the workload VM.
-    #[default]
-    Split,
-    /// The guard and the workload share one VM. Test credentials only.
-    Combined,
-}
-
-impl Topology {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Split => "split",
-            Self::Combined => "combined",
-        }
-    }
-}
-
-impl std::str::FromStr for Topology {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "split" => Ok(Self::Split),
-            "combined" => Ok(Self::Combined),
-            other => Err(format!(
-                "unknown topology '{other}'; use 'split' or 'combined'"
-            )),
-        }
-    }
-}
 
 #[derive(Clone)]
 pub struct TensorlakeComputeConfig {
@@ -85,8 +51,6 @@ pub struct TensorlakeComputeConfig {
     pub poll_interval: Duration,
     /// Default log level for the guard when the sandbox spec sets none.
     pub log_level: String,
-    /// Guard placement.
-    pub topology: Topology,
     /// Registered Tensorlake image for guard VMs. `None` uses
     /// `default_image`, which contains the guard and the Tensorlake CLI.
     pub guard_image: Option<String>,
@@ -112,7 +76,6 @@ impl std::fmt::Debug for TensorlakeComputeConfig {
             .field("timeout_secs", &self.timeout_secs)
             .field("allow_out", &self.allow_out)
             .field("poll_interval", &self.poll_interval)
-            .field("topology", &self.topology)
             .field("guard_image", &self.guard_image)
             .field("guard_cpus", &self.guard_cpus)
             .field("guard_memory_mb", &self.guard_memory_mb)
@@ -185,7 +148,7 @@ impl TensorlakeComputeConfig {
         Ok(())
     }
 
-    /// Image for guard VMs in the split topology.
+    /// Image for guard VMs.
     pub fn guard_image(&self) -> &str {
         self.guard_image.as_deref().unwrap_or(&self.default_image)
     }
@@ -197,9 +160,9 @@ impl TensorlakeComputeConfig {
             .and_then(|url| url.host_str().map(str::to_string))
     }
 
-    /// Tensorlake `allow_out` for the VM that runs the guard, with the hosts
-    /// the guard itself needs added: the gateway, and in the split topology
-    /// the Tensorlake hosts the tunnel talks to.
+    /// Tensorlake `allow_out` for the guard VM, with the hosts the guard
+    /// itself needs added: the gateway and the Tensorlake hosts the tunnel
+    /// talks to.
     pub fn effective_allow_out(&self) -> Vec<String> {
         let mut entries = self.allow_out.clone();
         if entries.is_empty() {
@@ -216,9 +179,7 @@ impl TensorlakeComputeConfig {
         {
             push(host);
         }
-        if self.topology == Topology::Split
-            && let Some(host) = self.tensorlake_host()
-        {
+        if let Some(host) = self.tensorlake_host() {
             push(format!("*.{host}"));
             push(host);
         }
@@ -244,7 +205,6 @@ pub(crate) mod tests {
             allow_out: Vec::new(),
             poll_interval: DEFAULT_POLL_INTERVAL,
             log_level: "info".into(),
-            topology: Topology::Combined,
             guard_image: None,
             guard_cpus: DEFAULT_GUARD_CPUS,
             guard_memory_mb: DEFAULT_GUARD_MEMORY_MB,
@@ -266,7 +226,12 @@ pub(crate) mod tests {
         config.allow_out = vec!["api.anthropic.com".into()];
         assert_eq!(
             config.effective_allow_out(),
-            vec!["api.anthropic.com", "gateway.example.com"]
+            vec![
+                "api.anthropic.com",
+                "gateway.example.com",
+                "*.sandbox.tensorlake.ai",
+                "sandbox.tensorlake.ai"
+            ]
         );
     }
 
