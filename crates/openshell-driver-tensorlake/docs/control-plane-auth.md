@@ -1,7 +1,25 @@
 # Control-plane authentication on Tensorlake
 
-Status: proposed. The current `control/` setup uses OIDC, or no user
-authentication for tests.
+Status: decided. The control plane runs on Tensorlake behind a public URL and
+authenticates users with OIDC. The mTLS design below stays as the fallback
+for deployments that have no identity provider.
+
+## Decision
+
+A public gateway endpoint is inherent to a remote sandbox provider. Guards in
+sandbox VMs must dial the gateway, they cannot hold a Tensorlake key, and
+Tensorlake offers no inbound tunnel to a user's machine. So the gateway must
+accept connections from the internet, and the gateway itself must
+authenticate every user call.
+
+OIDC is the supported way to do that. The gateway already validates tokens,
+checks roles, and refreshes keys, and the CLI already logs in through a
+browser or a device code. The `control/` scripts refuse to start without an
+issuer unless the operator sets the test-only
+`OPENSHELL_CONTROL_ALLOW_UNAUTHENTICATED=1`.
+
+The mTLS-over-tunnel design below is not implemented. Use it if a deployment
+has no identity provider and cannot get one.
 
 ## Problem
 
