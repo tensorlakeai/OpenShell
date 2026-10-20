@@ -22,8 +22,7 @@ it makes goes through the guard, and the guard applies the policy.
 By default the guard and the workload run in two different VMs (the
 "split" topology). The workload VM has no outbound network at all, and the
 guard VM reaches it through a Tensorlake tunnel. Credentials never enter
-the VM that runs the agent. The design and its measurements are in
-[docs/split-topology.md](docs/split-topology.md).
+the VM that runs the agent. See [Design decisions](#design-decisions).
 
 With `--topology combined`, both run in one VM. That is cheaper, but a root
 user in that VM can read the guard's credentials. Use it with test
@@ -121,6 +120,44 @@ it from outside.
 
 `--allow-out` limits where the guard VM itself can connect. See
 [Run the driver](#run-the-driver).
+
+### Design decisions
+
+**Why two VMs.** In one VM, a kernel exploit gives the agent the gateway
+token and the provider credentials. In two VMs, it gives the agent root in
+a VM that holds only its own channel key. Egress is still blocked by the
+Tensorlake fence and still mediated by the guard. This matches the
+Kubernetes driver, which runs one guard pod per workload pod.
+
+| Attacker | Combined | Split |
+|---|---|---|
+| Agent with a kernel exploit | Reads the guard's credentials | Gets root in a VM with no credentials |
+| Project member with `tl sbx exec --user root` | Reads everything | Reads everything in the guard VM |
+| Holder of a guard VM's Tensorlake key | n/a | Can open tunnels to any sandbox in the project |
+
+The guard key is the new exposure. Keep the control plane in a project of
+its own. Keys scoped to one tunnel target would close it and need platform
+work.
+
+**Why the tunnel.** Tensorlake has no private network between sandboxes
+and no sandbox IP in its API. The HTTPS port proxy terminates TLS, so it
+cannot carry the OpenShell channel. The tunnel relays raw TCP and works
+with the workload's internet off. Measured on 2026-10-20: 100 tunnels from
+one sandbox, 500 concurrent connections through one tunnel, about 300 MiB/s
+each way, still relaying after 13 minutes idle, 15 MiB RSS per tunnel. If
+Tensorlake adds a sandbox IP, the driver puts it into the `Tcp` transport
+and drops the tunnel. Nothing else changes.
+
+**Why not guards in the control sandbox.** That saves the guard VMs, but
+it puts every credential of the project in one kernel, shares 2 vCPUs
+across all guards, and drops every session when the control sandbox
+restarts. A 4 GiB control sandbox would fit about 50 guards.
+
+**Cost.** Two VMs per sandbox. The guard VM defaults to 1 vCPU and 1 GiB;
+the guard uses about 32 MiB and the tunnel 15 MiB. Both VMs boot in
+parallel, so create to ready stays a few seconds. All workload egress
+crosses the guard VM, which pays for TLS and policy on it. Raise
+`--guard-cpus` for agents that move bulk data.
 
 ## Build the images
 
