@@ -116,8 +116,7 @@ it from outside.
 token and the provider credentials. In two VMs, it gives the agent root in
 a VM that holds only its own channel key. Egress is still blocked by the
 Tensorlake fence and still mediated by the guard. This matches the
-Kubernetes driver, which runs one guard pod per workload pod. A one-VM
-mode existed and was removed: it was cheaper, unverified, and unsafe.
+Kubernetes driver, which runs one guard pod per workload pod.
 
 | Attacker | Gets |
 |---|---|
