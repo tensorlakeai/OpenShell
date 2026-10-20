@@ -17,8 +17,8 @@
 # variables in FROM, so the image tags are fixed here. Pin the upstream
 # commit this branch is based on, the same as control/Dockerfile.
 
-FROM ghcr.io/nvidia/openshell/supervisor:1cb9ef8ab469354a641893f8e26957e988f5c7ef AS supervisor
-FROM ghcr.io/nvidia/openshell/sandbox:1cb9ef8ab469354a641893f8e26957e988f5c7ef AS sandbox
+FROM ghcr.io/nvidia/openshell/supervisor:ea265a2f9a86e6fc1911041fec4b5fdcefd674dd AS supervisor
+FROM ghcr.io/nvidia/openshell/sandbox:ea265a2f9a86e6fc1911041fec4b5fdcefd674dd AS sandbox
 
 FROM ubuntu:24.04
 
