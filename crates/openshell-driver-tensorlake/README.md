@@ -255,6 +255,7 @@ openshell-gateway --compute-driver tensorlake \
 | `--grpc-endpoint` | `OPENSHELL_GRPC_ENDPOINT` | required |
 | `--gateway-tls-ca` | `OPENSHELL_TENSORLAKE_GATEWAY_TLS_CA` | required for an `https` endpoint |
 | `--tensorlake-api-url` | `TENSORLAKE_API_URL` | `https://sandbox.tensorlake.ai` |
+| `--tensorlake-platform-api-url` | `TENSORLAKE_PLATFORM_API_URL` | `https://api.tensorlake.ai`; where the tunnel checks its key |
 | `--tensorlake-api-key` | `TENSORLAKE_API_KEY` | required |
 | `--sandbox-image` | `OPENSHELL_SANDBOX_IMAGE` | required |
 | `--guard-image` | `OPENSHELL_TENSORLAKE_GUARD_IMAGE` | the sandbox image |
@@ -273,15 +274,19 @@ The guard trusts only the certificates in `--gateway-tls-ca`. It does not
 trust public root certificates. If your gateway has a public certificate,
 pass the root certificate that signed it.
 
-The Tensorlake timeout counts idle time, and only incoming traffic resets
-it. The guard's traffic to the gateway is outgoing. So a short timeout can
-pause a sandbox that is still working. Keep the default `0`, which uses the
-longest timeout your plan allows.
+The Tensorlake timeout counts idle time. Keep the default `0`, which uses
+the longest timeout your plan allows (7200 seconds on 2026-10-20). In a
+test with a 180 second timeout, a sandbox with no user traffic was still
+running and Ready after 5 minutes, so the guard's session and the tunnel
+appear to keep the clock reset. Do not rely on that for long pauses.
 
-When you set `--allow-out`, the driver turns off internet access for the
-VM that runs the guard and allows only the hosts you listed, the gateway
-host, and the Tensorlake host that the tunnel talks to. The workload VM
-always has internet access off with an empty allow list.
+When you set `--allow-out`, the VM that runs the guard can connect only to
+the hosts you listed, the gateway host, and the two Tensorlake hosts the
+tunnel talks to: the sandbox API and the platform API. Tensorlake's
+resolver then answers only for those names. Internet access stays on in
+the Tensorlake policy, because turning it off also turns off DNS, and the
+tunnel cannot find its own API. The workload VM always has internet access
+off with an empty allow list.
 
 ## Run the control plane on Tensorlake
 
@@ -413,8 +418,9 @@ workloads in it.
   failed with reason `DriverRestarted`. A pair with one VM missing is
   reported as failed with reason `PairIncomplete`. A pair whose VMs were
   running but whose launch scripts had not started yet is recovered as
-  running, and the gateway then waits for a guard that never connects.
-  Delete and recreate such a sandbox.
+  running. The gateway then keeps it in `Provisioning` with reason
+  `ConfigurationPending`, and it never becomes Ready. Delete and recreate
+  such a sandbox.
 - Anyone with access to your Tensorlake project can run
   `tl sbx exec --user root` in the guard VM and read its credentials, or in
   the workload VM and get around OpenShell policy. Keep the control plane
@@ -492,6 +498,25 @@ End-to-end runs on Tensorlake Cloud confirmed:
   the launch script as root; the guard reaches the gateway through the port
   proxy; image builds accept the multi-stage Dockerfiles and the `--public`
   flag.
+- On 2026-10-20, with the control plane on Tensorlake: the conformance
+  test files `smoke`, `file_transfer`, and `policy_advisor` pass, 7
+  scenarios in about 2 minutes, and `mechanistic-proposal` sees `DENIED`
+  through the tunnel. Killing the launch script in either VM gives
+  `LauncherExited` with the role in the message. After a control plane
+  restart, the driver recovered 3 sandboxes; a Ready sandbox stayed Ready
+  and `exec` worked, and no `name cannot be changed` error appeared. A
+  sandbox created 3 seconds before the restart had both VMs running but no
+  launch script, and stayed in `Provisioning` (see [Limits](#limits)).
+  With a 180 second idle timeout, a sandbox with no user traffic was still
+  running and Ready after 5 minutes. The tunnel first calls
+  `api.tensorlake.ai` to check its key, then `sandbox.tensorlake.ai`; the
+  guard reaches the gateway through `*.sandbox.tensorlake.ai`. A
+  Tensorlake policy with internet off and an allow list blocks all DNS,
+  so the tunnel failed with `dns error`; with internet on and an allow
+  list, listed hosts connect, an unlisted IP is reset at the TLS
+  handshake, and the resolver answers only for listed names. With
+  `--allow-out api.anthropic.com`, create to `hello` works and the guard
+  VM reaches that host. Delete removes both VMs of every sandbox.
 
 Three findings shaped the design. The sandbox runtime rejects
 boundary peers on loopback, so the tunnel needs the veth forwarder. Binary
@@ -500,273 +525,7 @@ so the runtime must run in its own PID namespace. And the transparent TCP capabi
 is for guards that share the workload's network namespace, so this driver
 no longer grants it.
 
-### Still to confirm
-
-- The conformance scenarios `smoke`, `file_transfer`, and `policy_advisor`
-  pass.
-- The port proxy keeps a long-lived connection open, and the idle timeout
-  does not pause a sandbox whose only traffic is the guard's outgoing
-  session.
-- A driver restart recovers running sandbox pairs.
-- Which Tensorlake hosts the tunnel needs, so `--allow-out` can be tight on
-  the guard VM.
-
-### Runbook
-
-This runbook covers the items in [Still to confirm](#still-to-confirm).
-Remove the steps that pass once they are recorded above.
-
-Use two shells. Shell A keeps the tunnel open. Shell B runs everything
-else. Some steps run `deploy.sh` again, so keep the exported variables in
-shell B for the whole run. The steps assume the control sandbox is
-`openshell-control`, the CLI gateway is named `tensorlake`, and the tunnel
-listens on port 18080.
-
-Each OpenShell sandbox has two Tensorlake VMs: `openshell-<id>` for the
-workload and `openshell-<id>-guard` for the guard, where `<id>` is the
-OpenShell sandbox ID. `tl sbx ls` shows both names. The commands below
-call them `$WORKLOAD_VM` and `$GUARD_VM`.
-
-#### 0. Build and deploy the control plane
-
-Build the two images. Skip this if you already have a pair you trust:
-
-```shell
-cd ~/Documents/work/OpenShell
-SANDBOX_IMAGE=openshell-tensorlake-test CONTROL_IMAGE=openshell-control-test \
-  crates/openshell-driver-tensorlake/build-images.sh
-```
-
-Export the deploy settings. For a test gateway without a login service:
-
-```shell
-export TENSORLAKE_API_KEY=your_api_key
-export CONTROL_IMAGE=openshell-control-test
-export OPENSHELL_CONTROL_ALLOW_UNAUTHENTICATED=1
-```
-
-With a login service, replace the last line with
-`export OPENSHELL_OIDC_ISSUER=https://issuer.example.com`.
-
-Deploy. Use `RECREATE=1` if a control sandbox already exists and you want
-the new image:
-
-```shell
-RECREATE=1 crates/openshell-driver-tensorlake/control/deploy.sh
-```
-
-The script prints the public URL and the sandbox ID. Check that the
-control plane came up:
-
-```shell
-tl sbx logs openshell-control | tail -20
-```
-
-Expected: a line `control plane started at https://8080-...` and no
-`error` lines.
-
-Open the tunnel in shell A:
-
-```shell
-tl sbx tunnel openshell-control 8080 --listen-port 18080
-```
-
-Back in shell B, build the CLI, register the gateway, and check it:
-
-```shell
-cargo build -p openshell-cli
-export OPENSHELL_BIN=$PWD/target/debug/openshell
-$OPENSHELL_BIN gateway add http://127.0.0.1:18080 --name tensorlake
-export OPENSHELL_GATEWAY=tensorlake
-$OPENSHELL_BIN gateway list
-$OPENSHELL_BIN status
-```
-
-If the gateway name is already registered from an earlier run, the add
-fails. Remove the old entry first with
-`$OPENSHELL_BIN gateway remove tensorlake`, or pick a new name and export
-that instead. Both commands must succeed before you go on.
-
-Create one sandbox and watch the launch steps:
-
-```shell
-$OPENSHELL_BIN sandbox create --name hello -- echo hello
-```
-
-Expected: the CLI shows the VM request, the VM start, the bundle upload,
-and the wait for the guard, then prints `hello`. `tl sbx ls` shows two
-new VMs. Delete it with `$OPENSHELL_BIN sandbox delete hello`.
-
-#### 1. Conformance suite
-
-Allow up to an hour. Each scenario creates its own sandboxes and deletes
-them. Run the three test files that fit this driver and save the output:
-
-```shell
-cargo test --locked \
-  --manifest-path tests/suites/conformance/Cargo.toml \
-  --package openshell-test-conformance-cli \
-  --test smoke --test file_transfer --test policy_advisor \
-  --no-fail-fast -- --test-threads=1 --nocapture 2>&1 \
-  | tee ~/tensorlake-conformance.log
-```
-
-Do not run `--test lifecycle`. It stops and starts a sandbox, which this
-driver rejects by design.
-
-In the log, the line to look for is `DENIED` from the `denied-tcp-open`
-step of `mechanistic-proposal`.
-
-#### 2. Launch script death
-
-The driver watches the launch script in both VMs. Test both roles.
-
-```shell
-$OPENSHELL_BIN sandbox create --name kill-test --detach
-$OPENSHELL_BIN sandbox get kill-test
-```
-
-Repeat the get until it shows Ready. Then find the two VM names and
-confirm that the launch script runs in each:
-
-```shell
-tl sbx ls | grep openshell-
-export WORKLOAD_VM=openshell-<id>
-export GUARD_VM=openshell-<id>-guard
-tl sbx ps $WORKLOAD_VM
-tl sbx ps $GUARD_VM
-```
-
-Kill the script in the guard VM first:
-
-```shell
-tl sbx exec --user root $GUARD_VM pkill -f openshell-tensorlake-launch
-sleep 10
-$OPENSHELL_BIN sandbox get kill-test
-```
-
-Expected: Ready is False, the reason is `LauncherExited`, and the message
-names the guard launcher and the guard VM. Delete the sandbox, create it
-again, and repeat with `$WORKLOAD_VM`. Expected: the same reason, with
-the message naming the workload launcher. Keep the second sandbox for
-step 6.
-
-#### 3. Driver restart
-
-Create one sandbox and wait for Ready. Then create a second and do not
-wait:
-
-```shell
-$OPENSHELL_BIN sandbox create --name restart-a --detach
-$OPENSHELL_BIN sandbox get restart-a
-$OPENSHELL_BIN sandbox create --name restart-b --detach
-```
-
-Restart the control plane by running the deploy script again with the
-same variables. Without `RECREATE=1`, it keeps the sandbox and the gateway
-state and only restarts the process:
-
-```shell
-crates/openshell-driver-tensorlake/control/deploy.sh
-```
-
-If the tunnel in shell A dropped, start it again. Then check:
-
-```shell
-tl sbx logs openshell-control | grep -i recovered
-$OPENSHELL_BIN sandbox list
-$OPENSHELL_BIN sandbox exec --name restart-a --no-tty -- echo hello
-$OPENSHELL_BIN sandbox get restart-b
-```
-
-Expected: a `Recovered Tensorlake sandboxes` log line, `restart-a` still
-Ready with the exec printing `hello`, and `restart-b` Failed with reason
-`DriverRestarted` if a VM was still pending at restart time. If both VMs
-of `restart-b` were already running, the driver recovers it as running.
-It then becomes Ready only if its launch scripts had started before the
-restart. Record which case you saw. The gateway log must show no
-`name cannot be changed after creation` error: the driver reports each
-recovered sandbox under the name in its saved request.
-
-#### 4. Idle timeout
-
-Read the timeout that the control sandbox got from the default of `0`:
-
-```shell
-tl sbx describe openshell-control
-```
-
-Note the timeout value. That is the plan maximum. Then run a bounded test
-with a 3 minute timeout. `deploy.sh` forwards every `OPENSHELL_TENSORLAKE_*`
-variable to the driver:
-
-```shell
-OPENSHELL_TENSORLAKE_TIMEOUT_SECS=180 crates/openshell-driver-tensorlake/control/deploy.sh
-$OPENSHELL_BIN sandbox create --name idle-test --detach
-$OPENSHELL_BIN sandbox get idle-test
-```
-
-Wait for Ready, then leave it alone for 5 minutes and check:
-
-```shell
-sleep 300
-$OPENSHELL_BIN sandbox get idle-test
-tl sbx ls | grep openshell-
-```
-
-Expected: the sandbox shows Suspended, because the guard's outgoing
-session did not reset the idle clock. That confirms the plan maximum must
-be long enough for a user session. Afterwards, deploy again without the
-variable to restore the default:
-
-```shell
-crates/openshell-driver-tensorlake/control/deploy.sh
-```
-
-#### 5. Tunnel hosts and `--allow-out`
-
-Find which hosts the tunnel in a guard VM talks to. Use a Ready sandbox,
-for example `restart-a`:
-
-```shell
-tl sbx exec --user root $GUARD_VM ss -tnp
-tl sbx exec --user root $GUARD_VM cat /etc/hosts
-```
-
-Note the peer addresses of the `tl` process and resolve them. Then
-deploy with an allow list and check that a sandbox still becomes Ready:
-
-```shell
-OPENSHELL_TENSORLAKE_ALLOW_OUT=api.anthropic.com crates/openshell-driver-tensorlake/control/deploy.sh
-$OPENSHELL_BIN sandbox create --name allow-test -- echo hello
-```
-
-Expected: `hello`. If the sandbox never becomes Ready, read
-`tl sbx logs $GUARD_VM`. A tunnel that cannot reach its host exits, and
-the driver reports `LauncherExited` for the guard. Make
-`effective_allow_out` in `src/config.rs` add the hosts you found, then
-deploy again without the variable.
-
-#### 6. Delete
-
-```shell
-$OPENSHELL_BIN sandbox delete kill-test restart-a restart-b idle-test allow-test
-sleep 10
-$OPENSHELL_BIN sandbox list
-tl sbx ls
-```
-
-Expected: no sandboxes in the first list, and no names starting with
-`openshell-` in the second, apart from `openshell-control`.
-
-#### What to collect
-
-- The conformance log file.
-- The output of each `get`, `list`, and `ps` command.
-- The last 50 lines of `tl sbx logs openshell-control`.
-- The tunnel peer addresses from step 5.
-
-## After the runbook passes
+## Next steps
 
 This section is a temporary plan. Remove it once the work is done.
 
@@ -816,8 +575,8 @@ you record the final run.
 
 Run the `Tensorlake Images` workflow with a version and `public: true`, or
 run `PUBLIC=1 VERSION=<version> build-images.sh` from a clean checkout in
-the project that owns the public images. Do this only after the runbook
-passes, because a published version cannot be replaced.
+the project that owns the public images. Publish from a commit whose
+tests passed, because a published version cannot be replaced.
 
 ### 3. Later
 

@@ -540,13 +540,13 @@ fn add_guard_files(archive: &mut Archive, files: &GuardFiles<'_>) -> Result<(), 
     )
 }
 
-/// The Tensorlake key, the Tensorlake sandbox API URL, and the
-/// `tl sbx tunnel` arguments for the tunnel identity in the guard VM.
+/// The Tensorlake key, the Tensorlake API URLs, and the `tl sbx tunnel`
+/// arguments for the tunnel identity in the guard VM.
 ///
 /// The launch script starts the tunnel with `env -i`, so this file is the
 /// whole environment the `tl` CLI sees. `tl` reads the sandbox API URL
-/// from `TENSORLAKE_SANDBOX_API_URL`; its `TENSORLAKE_API_URL` names the
-/// main Tensorlake API, not the sandbox API this driver is configured with.
+/// from `TENSORLAKE_SANDBOX_API_URL` and the platform API URL, where it
+/// checks the key, from `TENSORLAKE_API_URL`.
 fn add_tunnel_files(
     archive: &mut Archive,
     config: &TensorlakeComputeConfig,
@@ -556,7 +556,7 @@ fn add_tunnel_files(
     if config.api_key.contains(['\0', '\n']) {
         return Err("Tensorlake API key is not representable in the tunnel environment".into());
     }
-    if config.api_url.contains(['\0', '\n']) {
+    if config.api_url.contains(['\0', '\n']) || config.platform_api_url.contains(['\0', '\n']) {
         return Err("Tensorlake API URL is not representable in the tunnel environment".into());
     }
     archive.directory(TUNNEL_DIR, 0o700, tunnel)?;
@@ -567,6 +567,7 @@ fn add_tunnel_files(
         &nul_list([
             format!("TENSORLAKE_API_KEY={}", config.api_key),
             format!("TENSORLAKE_SANDBOX_API_URL={}", config.api_url),
+            format!("TENSORLAKE_API_URL={}", config.platform_api_url),
         ]),
     )?;
     archive.file(
@@ -830,6 +831,7 @@ mod tests {
         let mut config = crate::config::tests::test_config();
         config.api_key = "tl_secret_key".into();
         config.api_url = "https://sandbox.example.test".into();
+        config.platform_api_url = "https://api.example.test".into();
         let bundles = build_launch_bundles(LaunchBundleInput {
             sandbox: &sandbox,
             config: &config,
@@ -884,7 +886,7 @@ mod tests {
         assert_eq!((*mode, *uid), (0o600, u64::from(TUNNEL_UID)));
         assert_eq!(
             env,
-            b"TENSORLAKE_API_KEY=tl_secret_key\0TENSORLAKE_SANDBOX_API_URL=https://sandbox.example.test\0"
+            b"TENSORLAKE_API_KEY=tl_secret_key\0TENSORLAKE_SANDBOX_API_URL=https://sandbox.example.test\0TENSORLAKE_API_URL=https://api.example.test\0"
         );
         let (mode, uid, _) = entry(&guard, TUNNEL_DIR);
         assert_eq!((*mode, *uid), (0o700, u64::from(TUNNEL_UID)));

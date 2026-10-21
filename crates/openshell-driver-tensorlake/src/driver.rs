@@ -439,10 +439,14 @@ impl TensorlakeComputeDriver {
             return Err(Status::already_exists("sandbox already exists"));
         }
         // The guard VM needs the gateway and the Tensorlake hosts. Empty
-        // keeps Tensorlake's default internet.
+        // keeps Tensorlake's default internet. With an allow list, internet
+        // access stays on: Tensorlake then connects only to the listed hosts
+        // and its resolver answers only for them. Turning internet off as
+        // well blocks DNS, and the tunnel cannot resolve its own API host
+        // (verified on 2026-10-20).
         let allow_out = self.config.effective_allow_out();
         let guard_network = (!allow_out.is_empty()).then(|| NetworkPolicy {
-            allow_internet_access: false,
+            allow_internet_access: true,
             allow_out,
             deny_out: Vec::new(),
         });

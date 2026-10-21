@@ -12,6 +12,7 @@ use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_tensorlake::config::{
     DEFAULT_API_URL, DEFAULT_CPUS, DEFAULT_GUARD_CPUS, DEFAULT_GUARD_MEMORY_MB, DEFAULT_MEMORY_MB,
+    DEFAULT_PLATFORM_API_URL,
 };
 use openshell_driver_tensorlake::{
     ComputeDriverService, TensorlakeComputeConfig, TensorlakeComputeDriver,
@@ -54,6 +55,15 @@ struct Args {
 
     #[arg(long, env = "TENSORLAKE_API_URL", default_value = DEFAULT_API_URL)]
     tensorlake_api_url: String,
+
+    /// Tensorlake platform API. The tunnel in each guard VM checks its key
+    /// there, so `--allow-out` adds this host.
+    #[arg(
+        long,
+        env = "TENSORLAKE_PLATFORM_API_URL",
+        default_value = DEFAULT_PLATFORM_API_URL
+    )]
+    tensorlake_platform_api_url: String,
 
     #[arg(long, env = "TENSORLAKE_API_KEY", hide_env_values = true)]
     tensorlake_api_key: String,
@@ -126,6 +136,7 @@ async fn main() -> Result<()> {
 
     let config = TensorlakeComputeConfig {
         api_url: args.tensorlake_api_url,
+        platform_api_url: args.tensorlake_platform_api_url,
         api_key: args.tensorlake_api_key,
         default_image: args.sandbox_image,
         grpc_endpoint: args.grpc_endpoint,

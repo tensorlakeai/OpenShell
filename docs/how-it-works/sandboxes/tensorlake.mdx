@@ -150,16 +150,16 @@ socket_path = "/run/openshell/tensorlake.sock"
 | `--cpus`, `--memory-mb`, `--disk-mb` | `OPENSHELL_TENSORLAKE_*` | 2, 4096, Tensorlake default |
 | `--timeout-secs` | `OPENSHELL_TENSORLAKE_TIMEOUT_SECS` | `0`, the plan maximum |
 | `--allow-out` | `OPENSHELL_TENSORLAKE_ALLOW_OUT` | Empty. Internet on for the guard VM; the guard enforces policy. |
+| `--tensorlake-platform-api-url` | `TENSORLAKE_PLATFORM_API_URL` | `https://api.tensorlake.ai`. Where the tunnel checks its key. |
 | `--state-dir` | `OPENSHELL_TENSORLAKE_STATE_DIR` | `target/openshell-tensorlake-driver`. Holds a copy of each sandbox request for recovery after a restart. |
 
-Keep `--timeout-secs` at `0`. Tensorlake counts idle time from incoming
-traffic only, and the guard's traffic is outgoing, so a short timeout suspends
-a sandbox that is still working.
+Keep `--timeout-secs` at `0`, the longest idle timeout your plan allows. A
+shorter timeout can suspend a sandbox that is still working.
 
 `--allow-out` adds a second fence at the Tensorlake network for the VM that
-runs the guard. The driver turns off internet access for it and allows only
-the hosts you list, the gateway host, and the Tensorlake host the tunnel uses.
-The workload VM always has all outbound traffic off.
+runs the guard. That VM can then connect only to the hosts you list, the
+gateway host, and the two Tensorlake hosts the tunnel uses. The workload VM
+always has all outbound traffic off.
 
 ## Images
 
@@ -209,5 +209,5 @@ Two things to know:
 - Each sandbox uses two Tensorlake VMs. The guard VM defaults to 1 vCPU and
   1 GiB.
 
-For build details, the test runbook, and the design notes, see the
+For build details, test results, and the design notes, see the
 [driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-tensorlake/README.md).

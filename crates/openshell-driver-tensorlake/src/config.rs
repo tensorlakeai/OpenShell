@@ -9,6 +9,10 @@ use std::time::Duration;
 /// Default Tensorlake sandbox lifecycle API.
 pub const DEFAULT_API_URL: &str = "https://sandbox.tensorlake.ai";
 
+/// Default Tensorlake platform API. The tunnel in each guard VM checks its
+/// key there before it connects to the sandbox API.
+pub const DEFAULT_PLATFORM_API_URL: &str = "https://api.tensorlake.ai";
+
 /// Default vCPU count when the sandbox template sets no CPU limit.
 pub const DEFAULT_CPUS: f64 = 2.0;
 
@@ -29,6 +33,9 @@ pub const DEFAULT_GUARD_MEMORY_MB: i64 = 1024;
 pub struct TensorlakeComputeConfig {
     /// Tensorlake sandbox lifecycle API base URL.
     pub api_url: String,
+    /// Tensorlake platform API base URL. The guard VM's tunnel checks its
+    /// key there, so the host must be reachable from the guard VM.
+    pub platform_api_url: String,
     /// Tensorlake API key. Sent as a bearer token.
     pub api_key: String,
     /// Registered Tensorlake image that contains the `OpenShell` guard,
@@ -66,6 +73,7 @@ impl std::fmt::Debug for TensorlakeComputeConfig {
         formatter
             .debug_struct("TensorlakeComputeConfig")
             .field("api_url", &self.api_url)
+            .field("platform_api_url", &self.platform_api_url)
             .field("api_key", &"[REDACTED]")
             .field("default_image", &self.default_image)
             .field("grpc_endpoint", &self.grpc_endpoint)
@@ -115,23 +123,12 @@ impl TensorlakeComputeConfig {
                 ));
             }
         }
-        let api_url = url::Url::parse(&self.api_url)
-            .map_err(|error| format!("invalid Tensorlake API URL: {error}"))?;
-        // The guard's tunnel receives this URL as TENSORLAKE_SANDBOX_API_URL.
-        // The tl CLI silently ignores values of any other shape and falls
-        // back to the public service, so reject them here.
-        if !matches!(api_url.scheme(), "http" | "https")
-            || api_url.host_str().is_none()
-            || api_url.query().is_some()
-            || api_url.fragment().is_some()
-            || !api_url.username().is_empty()
-            || api_url.password().is_some()
-        {
-            return Err(
-                "Tensorlake API URL must be an http or https URL with a host and no query, fragment, or credentials"
-                    .into(),
-            );
-        }
+        // The guard's tunnel receives these URLs as TENSORLAKE_SANDBOX_API_URL
+        // and TENSORLAKE_API_URL. The tl CLI silently ignores values of any
+        // other shape and falls back to the public service, so reject them
+        // here.
+        validate_tunnel_url("Tensorlake API URL", &self.api_url)?;
+        validate_tunnel_url("Tensorlake platform API URL", &self.platform_api_url)?;
         if self.default_cpus.is_nan() || self.default_cpus <= 0.0 || self.default_memory_mb <= 0 {
             return Err("default CPU and memory must be positive".into());
         }
@@ -153,16 +150,13 @@ impl TensorlakeComputeConfig {
         self.guard_image.as_deref().unwrap_or(&self.default_image)
     }
 
-    /// Host of the Tensorlake API, which the guard VM's tunnel must reach.
-    fn tensorlake_host(&self) -> Option<String> {
-        url::Url::parse(&self.api_url)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_string))
-    }
-
     /// Tensorlake `allow_out` for the guard VM, with the hosts the guard
-    /// itself needs added: the gateway and the Tensorlake hosts the tunnel
-    /// talks to.
+    /// itself needs added: the gateway, the sandbox API that the tunnel
+    /// relays through, and the platform API where the tunnel checks its
+    /// key. Verified on 2026-10-20: the tunnel calls
+    /// `api.tensorlake.ai/platform/v1/keys/introspect` first, then
+    /// `sandbox.tensorlake.ai`; the guard reaches the gateway through
+    /// `*.sandbox.tensorlake.ai`.
     pub fn effective_allow_out(&self) -> Vec<String> {
         let mut entries = self.allow_out.clone();
         if entries.is_empty() {
@@ -173,18 +167,40 @@ impl TensorlakeComputeConfig {
                 entries.push(host);
             }
         };
-        if let Some(host) = url::Url::parse(&self.grpc_endpoint)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_string))
-        {
+        if let Some(host) = url_host(&self.grpc_endpoint) {
             push(host);
         }
-        if let Some(host) = self.tensorlake_host() {
+        if let Some(host) = url_host(&self.api_url) {
             push(format!("*.{host}"));
+            push(host);
+        }
+        if let Some(host) = url_host(&self.platform_api_url) {
             push(host);
         }
         entries
     }
+}
+
+fn url_host(value: &str) -> Option<String> {
+    url::Url::parse(value)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+}
+
+fn validate_tunnel_url(label: &str, value: &str) -> Result<(), String> {
+    let url = url::Url::parse(value).map_err(|error| format!("invalid {label}: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(format!(
+            "{label} must be an http or https URL with a host and no query, fragment, or credentials"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -194,6 +210,7 @@ pub(crate) mod tests {
     pub fn test_config() -> TensorlakeComputeConfig {
         TensorlakeComputeConfig {
             api_url: DEFAULT_API_URL.into(),
+            platform_api_url: DEFAULT_PLATFORM_API_URL.into(),
             api_key: "key".into(),
             default_image: "openshell-tensorlake".into(),
             grpc_endpoint: "https://gateway.example.com:8080".into(),
@@ -230,7 +247,23 @@ pub(crate) mod tests {
                 "api.anthropic.com",
                 "gateway.example.com",
                 "*.sandbox.tensorlake.ai",
-                "sandbox.tensorlake.ai"
+                "sandbox.tensorlake.ai",
+                "api.tensorlake.ai"
+            ]
+        );
+    }
+
+    #[test]
+    fn allow_out_does_not_repeat_hosts() {
+        let mut config = test_config();
+        config.allow_out = vec!["sandbox.tensorlake.ai".into(), "api.tensorlake.ai".into()];
+        assert_eq!(
+            config.effective_allow_out(),
+            vec![
+                "sandbox.tensorlake.ai",
+                "api.tensorlake.ai",
+                "gateway.example.com",
+                "*.sandbox.tensorlake.ai"
             ]
         );
     }
@@ -259,6 +292,8 @@ pub(crate) mod tests {
         config.gateway_tls_ca = Some("ca".into());
         config.api_url = "https://byoc.example.test:8443/base".into();
         assert_eq!(config.validate(), Ok(()));
+        config.platform_api_url = "https://user:pw@api.example.test".into();
+        assert!(config.validate().unwrap_err().contains("platform API URL"));
     }
 
     #[test]
