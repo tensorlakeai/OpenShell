@@ -107,7 +107,18 @@ public URL. The proxy terminates TLS.
 Guards in sandbox VMs cannot hold a Tensorlake key, so the control-plane port
 must accept connections from anyone. The public URL cannot be hidden. The
 gateway makes this safe by checking every call for a valid OIDC token. A call
-without one gets `Unauthenticated`.
+without one gets `Unauthenticated`. A user who holds only the user role must
+also be a member of the workspace. Add members with
+`openshell workspace member add`.
+
+<Note>
+The Tensorlake port proxy drops the gRPC status from error responses. A
+denied or unauthenticated call through the public URL reaches the CLI as
+`protocol error: missing grpc-status trailer`. When you see that message,
+run `openshell gateway login` first. If it persists, run the same command
+through a Tensorlake tunnel to read the real status. Successful calls are
+not affected.
+</Note>
 
 For a short test without an identity provider, set
 `OPENSHELL_CONTROL_ALLOW_UNAUTHENTICATED=1` before you deploy, and reach the

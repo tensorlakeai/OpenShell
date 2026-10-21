@@ -539,6 +539,21 @@ End-to-end runs on Tensorlake Cloud confirmed:
   brings it back. `tl sbx suspend` on a running workload VM did not finish
   within 120 seconds; the driver's stop ends the runtime first and then
   suspends without delay. The `smoke` test file still passes.
+- On 2026-10-21, user login: with Keycloak 24 in a second Tensorlake
+  sandbox behind its exposed port, and `OPENSHELL_OIDC_ISSUER` set to that
+  realm, the gateway discovered the issuer and loaded its keys at start.
+  `openshell gateway add <public URL> --oidc-issuer ...` opened the
+  browser and logged in. With the admin role, the OpenCode case study
+  passed in full through the public URL: model call, no egress, placeholder
+  key, rule approved and live in 10 seconds, stop and start. A call without
+  a token got `Unauthenticated`. A user-role account was denied until an
+  admin added it to the workspace, then could list and exec but not create
+  a provider, logged as `insufficient_workspace_role`. One defect: the
+  Tensorlake port proxy drops `grpc-status` and `grpc-message` from
+  trailers-only responses, so every denied call through the public URL
+  reaches the CLI as `protocol error: missing grpc-status trailer`. The
+  same call through `tl sbx tunnel` shows the real status. Successful
+  calls, which carry a body, are not affected.
 
 Three findings shaped the design. The sandbox runtime rejects
 boundary peers on loopback, so the tunnel needs the veth forwarder. Binary
@@ -651,3 +666,7 @@ tests passed, because a published version cannot be replaced.
   reach other sandboxes.
 - A tunnel that reconnects after a dropped WebSocket, so the sandbox pauses
   instead of failing.
+- Error status through the port proxy. The proxy drops the gRPC status
+  from trailers-only responses, so users see `missing grpc-status trailer`
+  instead of `Unauthenticated` or `PermissionDenied`. Either Tensorlake
+  fixes the proxy, or the gateway sends errors with a body and trailers.
