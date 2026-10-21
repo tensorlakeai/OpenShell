@@ -68,9 +68,9 @@ When the gateway asks for a new sandbox:
    `127.0.0.1:18443` and relays bytes to port 8443 of the workload VM, and
    the guard as user 65534. Neither user can read the other's files. The
    guard's TLS handshake runs end to end to the workload; the tunnel and
-   the forwarder do not inspect the bytes. In both topologies the workload
-   runtime is PID 1 of its own PID namespace, so network policy can resolve
-   which binary opened a connection.
+   the forwarder do not inspect the bytes. The workload runtime is PID 1
+   of its own PID namespace, so network policy can resolve which binary
+   opened a connection.
 5. The driver reports the sandbox as ready when both launch scripts
    started. The gateway marks the sandbox ready when the guard connects to
    it. During steps 1 to 5 the driver publishes progress events, so the
@@ -100,6 +100,10 @@ fresh credentials from the gateway. The guard gets a new session and the
 workload a new channel key; the old ones are gone with `/.openshell`. The
 main process starts again from the beginning, as in the other drivers.
 
+A failed sandbox cannot be started. Delete and recreate it. The one
+exception: when both VMs of a failed sandbox are suspended, the sandbox
+shows as stopped, and start launches it again.
+
 A guard VM suspended by hand, with `tl sbx suspend`, also shows the sandbox
 as stopped, and `openshell sandbox start` brings it back. Do not suspend
 the workload VM by hand: Tensorlake does not suspend it while the runtime
@@ -114,7 +118,7 @@ stays stopped until you start it.
 | `/.openshell/channel/sandbox/` (mode 0711) | workload | workload | bootstrap file, TLS certificate, and TLS key for the channel to the guard |
 | `/.openshell/supervisor/` (mode 0700) | guard | guard | auth bundle, sandbox token, gateway CA, runtime descriptor |
 | `/.openshell/supervisor/env`, `args` | guard | root | the guard's environment and arguments |
-| `/.openshell/tunnel/` (mode 0700) | guard | tunnel | `env` with the Tensorlake key and the sandbox API URL |
+| `/.openshell/tunnel/` (mode 0700) | guard | tunnel | `env` with the Tensorlake key, the sandbox API URL, and the platform API URL |
 | `/.openshell/tunnel/args` | guard | root | the `tl sbx tunnel` arguments |
 | `/.openshell/launch/params` | both | root | the role and the identities for the launch script |
 | `/.openshell/launch/resolv.conf` | workload | root | written by the launch script; points the workload at the runtime's DNS relay |
@@ -304,9 +308,10 @@ running and Ready after 5 minutes, so the guard's session and the tunnel
 appear to keep the clock reset. Do not rely on that for long pauses.
 
 When you set `--allow-out`, the VM that runs the guard can connect only to
-the hosts you listed, the gateway host, and the two Tensorlake hosts the
-tunnel talks to: the sandbox API and the platform API. Tensorlake's
-resolver then answers only for those names. Internet access stays on in
+the hosts you listed, the gateway host, and the Tensorlake hosts the
+tunnel talks to: the sandbox API host, every subdomain of it (the port
+proxy lives there), and the platform API host. Tensorlake's resolver then
+answers only for those names. Internet access stays on in
 the Tensorlake policy, because turning it off also turns off DNS, and the
 tunnel cannot find its own API. The workload VM always has internet access
 off with an empty allow list.
@@ -349,13 +354,17 @@ bundle in the control image for that connection.
    `/etc/openshell-control/control.env` (mode 0600): every
    `OPENSHELL_OIDC_*` and `OPENSHELL_TENSORLAKE_*` variable,
    `OPENSHELL_DB_URL`, `OPENSHELL_SANDBOX_IMAGE`, `OPENSHELL_GATEWAY_NAME`,
-   and `OPENSHELL_CONTROL_ALLOW_UNAUTHENTICATED`. So every driver setting
-   from the table above can be set through its environment variable. Then
-   it starts the control plane as a managed process that restarts on
-   failure. Run the script again to change settings. Gateway state stays
-   in `/var/lib/openshell`. Set `OPENSHELL_DB_URL` to use an external
-   database. `CONTROL_NAME` changes the sandbox name from
-   `openshell-control`, and `CONTROL_TIMEOUT_SECS` its idle timeout.
+   and `OPENSHELL_CONTROL_ALLOW_UNAUTHENTICATED`. So the driver settings
+   with an `OPENSHELL_TENSORLAKE_*` variable, the sandbox image, and the
+   gateway name can be set this way. The start script sets the socket, the
+   gateway endpoint, the gateway CA, and the state directory itself. The
+   Tensorlake API URLs, the log level, and the OTLP endpoint cannot be
+   changed from the control plane. Then the script starts the control
+   plane as a managed process that restarts on failure. Run the script
+   again to change settings. Gateway state stays in `/var/lib/openshell`.
+   Set `OPENSHELL_DB_URL` to use an external database. `CONTROL_NAME`
+   changes the sandbox name from `openshell-control`, and
+   `CONTROL_TIMEOUT_SECS` its idle timeout.
 
 3. Connect the CLI with the public URL. The CLI opens a browser so you can
    log in once. It stores the login and renews it on its own:
@@ -453,8 +462,11 @@ The unit tests cover:
 - Request mapping: CPU and memory quantities, Tensorlake names, and the
   requests the driver rejects.
 - Pairing of workload and guard VMs by name, the phase after a restart,
-  and the phase after each poll observation.
+  the phase after each poll observation, and the conditions reported for
+  stopped and starting sandboxes.
 - Launcher failure messages and the progress events the CLI shows.
+- The shape of the Tensorlake API requests, and the saved sandbox records
+  that recovery reads.
 
 They do not run the launch script, the Tensorlake API, the tunnel, or
 policy enforcement. `mise run lint` and `mise run test:rust` run the same
