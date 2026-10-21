@@ -85,6 +85,28 @@ When the gateway asks for a new sandbox:
 Tensorlake cannot push changes to the driver. So the driver asks Tensorlake
 for the list of sandboxes every few seconds.
 
+### Stop and start
+
+`openshell sandbox stop` ends the OpenShell processes in both VMs and
+suspends the VMs. Tensorlake keeps their disks, so the workspace and the
+agent's files stay. To end the processes, the driver runs the launch script
+with `--stop` as root: the script signals the previous launch script, kills
+what is left in the workload namespace and under the unprivileged
+identities, removes the namespace, and removes `/.openshell` and the
+runtime directories. Then the driver suspends the VM.
+
+`openshell sandbox start` resumes the VMs and runs steps 2 to 5 again with
+fresh credentials from the gateway. The guard gets a new session and the
+workload a new channel key; the old ones are gone with `/.openshell`. The
+main process starts again from the beginning, as in the other drivers.
+
+A guard VM suspended by hand, with `tl sbx suspend`, also shows the sandbox
+as stopped, and `openshell sandbox start` brings it back. Do not suspend
+the workload VM by hand: Tensorlake does not suspend it while the runtime
+holds its network namespace, and the command waits for nothing (seen on
+2026-10-21). A VM resumed by hand runs nothing of OpenShell; the sandbox
+stays stopped until you start it.
+
 ### Where the files live in the VMs
 
 | Path | VM | Owner | Contents |
@@ -96,6 +118,7 @@ for the list of sandboxes every few seconds.
 | `/.openshell/tunnel/args` | guard | root | the `tl sbx tunnel` arguments |
 | `/.openshell/launch/params` | both | root | the role and the identities for the launch script |
 | `/.openshell/launch/resolv.conf` | workload | root | written by the launch script; points the workload at the runtime's DNS relay |
+| `/.openshell/launch/pid`, `uids` | both | root | written by the launch script; the PID of the script and the identities it started, so the next launch or a stop can end them |
 
 ### The outer fence
 
@@ -401,33 +424,9 @@ openshell gateway add http://127.0.0.1:18080 --name tensorlake
 The control sandbox holds the Tensorlake API key. Do not run other
 workloads in it.
 
-## Limits
+## Scope
 
-- Stop and start are not supported. Delete the sandbox instead.
-- The workload identity accepts a numeric user ID and group ID only. The
-  default is 1000:1000.
-- No GPU, `driver_config`, `platform_config`, or `agent_socket_path`.
-- The driver keeps launch state in memory and a copy of each sandbox
-  request, without its credentials, under `--state-dir`. After a driver
-  restart, it finds running sandboxes again by their Tensorlake names
-  (`openshell-<id>` and `openshell-<id>-guard`) and reports them under the
-  names in the saved requests. Keep the state directory with the gateway
-  database: a recovered sandbox with no saved request has no name, and the
-  gateway then rejects every status update for it until it is deleted. A
-  pair with a VM still pending is reported as
-  failed with reason `DriverRestarted`. A pair with one VM missing is
-  reported as failed with reason `PairIncomplete`. A pair whose VMs were
-  running but whose launch scripts had not started yet is recovered as
-  running. The gateway then keeps it in `Provisioning` with reason
-  `ConfigurationPending`, and it never becomes Ready. Delete and recreate
-  such a sandbox.
-- Anyone with access to your Tensorlake project can run
-  `tl sbx exec --user root` in the guard VM and read its credentials, or in
-  the workload VM and get around OpenShell policy. Keep the control plane
-  in a project of its own.
-- Each guard VM holds a Tensorlake API key for its tunnel. That key can
-  open tunnels to any sandbox in the project.
-- Each sandbox uses two Tensorlake VMs.
+A single team with its own Tensorlake project can run it today.
 
 ## Testing
 
@@ -472,7 +471,7 @@ registered gateway, selected with `OPENSHELL_GATEWAY`. Its test files:
 | `smoke` | create, exec, delete | yes |
 | `file_transfer` | round trip, git filtering, path safety | yes |
 | `policy_advisor` | policy-local, mechanistic-proposal, new-hostname-proposal | yes |
-| `lifecycle` | stop, start, delete while stopped | no; the driver does not support stop and start |
+| `lifecycle` | stop, start, delete while stopped | yes |
 
 The `mechanistic-proposal` scenario opens a TCP connection to `1.1.1.1:443`
 from Bash inside the sandbox and expects `DENIED`. It then checks that the
@@ -506,7 +505,7 @@ End-to-end runs on Tensorlake Cloud confirmed:
   restart, the driver recovered 3 sandboxes; a Ready sandbox stayed Ready
   and `exec` worked, and no `name cannot be changed` error appeared. A
   sandbox created 3 seconds before the restart had both VMs running but no
-  launch script, and stayed in `Provisioning` (see [Limits](#limits)).
+  launch script, and stayed in `Provisioning`. Delete and recreate such a sandbox.
   With a 180 second idle timeout, a sandbox with no user traffic was still
   running and Ready after 5 minutes. The tunnel first calls
   `api.tensorlake.ai` to check its key, then `sandbox.tensorlake.ai`; the
@@ -517,6 +516,17 @@ End-to-end runs on Tensorlake Cloud confirmed:
   handshake, and the resolver answers only for listed names. With
   `--allow-out api.anthropic.com`, create to `hello` works and the guard
   VM reaches that host. Delete removes both VMs of every sandbox.
+
+- On 2026-10-21, stop and start: the conformance test file `lifecycle`
+  passes. Stop takes about 5 seconds, including the launcher's stop run in
+  both VMs and the two suspend requests. Start resumes both VMs and
+  reaches Ready in about 4 seconds; a file written to `/sandbox` before
+  the stop is still there, the main process runs a second time, and a
+  stopped sandbox can be deleted. A guard VM suspended with `tl sbx
+  suspend` shows the sandbox as `Stopped` within 3 seconds, and start
+  brings it back. `tl sbx suspend` on a running workload VM did not finish
+  within 120 seconds; the driver's stop ends the runtime first and then
+  suspends without delay. The `smoke` test file still passes.
 
 Three findings shaped the design. The sandbox runtime rejects
 boundary peers on loopback, so the tunnel needs the veth forwarder. Binary
@@ -580,7 +590,6 @@ tests passed, because a published version cannot be replaced.
 
 ### 3. Later
 
-- Stop and start.
 - GPU.
 - Tensorlake keys scoped to one tunnel target, so a guard VM's key cannot
   reach other sandboxes.

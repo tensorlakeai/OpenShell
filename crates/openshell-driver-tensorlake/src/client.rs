@@ -3,7 +3,8 @@
 
 //! Minimal Tensorlake sandbox HTTP client.
 //!
-//! Lifecycle calls go to the sandbox API (`POST/GET/DELETE /sandboxes`).
+//! Lifecycle calls go to the sandbox API (`POST/GET/DELETE /sandboxes`,
+//! `POST /sandboxes/{id}/suspend` and `/resume`).
 //! File and process calls go to the per-sandbox proxy (`sandbox_url`) with the
 //! `X-Tensorlake-Sandbox-Id` routing header.
 
@@ -230,6 +231,28 @@ impl TensorlakeClient {
             .await?;
         let body: ListSandboxesResponse = check(response).await?.json().await?;
         Ok(body.sandboxes)
+    }
+
+    /// Suspend a running sandbox. Tensorlake keeps its disk and memory;
+    /// the sandbox is `suspending`, then `suspended`.
+    pub async fn suspend_sandbox(&self, id: &str) -> Result<(), TensorlakeError> {
+        self.lifecycle_post(id, "suspend").await
+    }
+
+    /// Resume a suspended sandbox. It is `pending`, then `running`.
+    pub async fn resume_sandbox(&self, id: &str) -> Result<(), TensorlakeError> {
+        self.lifecycle_post(id, "resume").await
+    }
+
+    async fn lifecycle_post(&self, id: &str, action: &str) -> Result<(), TensorlakeError> {
+        let response = self
+            .http
+            .post(format!("{}/sandboxes/{id}/{action}", self.api_url))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await?;
+        check(response).await?;
+        Ok(())
     }
 
     /// Terminate a sandbox. Returns `false` when it no longer exists.

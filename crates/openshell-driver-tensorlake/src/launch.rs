@@ -39,6 +39,9 @@ use crate::config::TensorlakeComputeConfig;
 pub const BUNDLE_UPLOAD_PATH: &str = "/var/lib/openshell/launch-bundle.tar";
 /// Launcher baked into the Tensorlake image.
 pub const LAUNCHER_PATH: &str = "/opt/openshell/bin/openshell-tensorlake-launch";
+/// Launcher argument that ends the current generation without starting
+/// a new one. Stop runs it before it suspends the VM.
+pub const LAUNCHER_STOP_ARG: &str = "--stop";
 /// Guard identity inside the VM. It differs from the workload identity so the
 /// workload cannot read gateway credentials.
 pub const SUPERVISOR_UID: u32 = 65_534;

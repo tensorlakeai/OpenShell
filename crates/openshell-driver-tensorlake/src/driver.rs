@@ -9,6 +9,11 @@
 //! task then waits for the VMs to run, uploads a launch bundle to each, and
 //! starts the in-image launcher as root. A poll loop keeps status current
 //! because Tensorlake has no watch API.
+//!
+//! Stop ends the launched processes in both VMs and suspends the VMs, which
+//! keep their disks. Start resumes the VMs and launches a new generation
+//! with the fresh credentials the gateway sends, so the workspace comes back
+//! as it was.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -49,6 +54,13 @@ pub const GUARD_NAME_SUFFIX: &str = "-guard";
 /// How long a Tensorlake sandbox may stay pending before create fails.
 const PROVISION_TIMEOUT: Duration = Duration::from_mins(10);
 
+/// How long stop waits for a VM to leave `pending` or `suspending`, and for
+/// the launcher's stop run to finish, before it gives up.
+const STOP_TIMEOUT: Duration = Duration::from_mins(3);
+
+/// How long the launcher's `--stop` run may take to end a generation.
+const END_GENERATION_TIMEOUT: Duration = Duration::from_mins(1);
+
 const WATCH_BUFFER: usize = 256;
 
 /// `source` of the platform events this driver publishes.
@@ -62,7 +74,9 @@ enum Phase {
     Launching,
     /// The launcher started. The gateway waits for the guard session.
     Running,
-    Suspended,
+    /// Both VMs are suspended, or one of them is. The disks are kept, and
+    /// start resumes the VMs and launches a new generation.
+    Stopped,
     Failed {
         reason: String,
         message: String,
@@ -84,6 +98,9 @@ struct Record {
     launcher_pid: Option<i64>,
     /// PID of the launcher in the guard VM. `None` for recovered records.
     guard_launcher_pid: Option<i64>,
+    /// Counts launches. A provisioning task changes the record only while
+    /// its launch is the current one; stop and start each begin a new one.
+    launch: u64,
 }
 
 impl Record {
@@ -92,7 +109,7 @@ impl Record {
         sandbox.status = Some(DriverSandboxStatus {
             name: self.tensorlake_name.clone(),
             instance_id: self.tensorlake_id.clone(),
-            conditions: vec![ready_condition(&self.phase)],
+            conditions: phase_conditions(&self.phase),
             deleting: self.phase == Phase::Deleting,
             resolved_identity: self.identity.as_ref().map(|identity| ProtoIdentity {
                 uid: identity.uid,
@@ -105,6 +122,39 @@ impl Record {
         });
         sandbox
     }
+}
+
+fn condition(r#type: &str, status: &str, reason: &str, message: String) -> DriverCondition {
+    DriverCondition {
+        r#type: r#type.to_string(),
+        status: status.to_string(),
+        reason: reason.to_string(),
+        message,
+        transition_time: None,
+    }
+}
+
+/// The conditions the gateway reads for a phase. `Ready` carries the phase.
+/// `Suspended=True` tells the gateway a stopped sandbox stays stopped, and
+/// `Bootstrapping=True` tells it a stopped sandbox is starting again.
+fn phase_conditions(phase: &Phase) -> Vec<DriverCondition> {
+    let mut conditions = vec![ready_condition(phase)];
+    match phase {
+        Phase::Stopped => conditions.push(condition(
+            "Suspended",
+            "True",
+            "ComputeStopped",
+            "Tensorlake VMs are suspended and keep their disks".to_string(),
+        )),
+        Phase::Pending | Phase::Launching => conditions.push(condition(
+            "Bootstrapping",
+            "True",
+            "Starting",
+            "OpenShell launch in progress".to_string(),
+        )),
+        Phase::Running | Phase::Failed { .. } | Phase::Deleting => {}
+    }
+    conditions
 }
 
 fn ready_condition(phase: &Phase) -> DriverCondition {
@@ -124,11 +174,10 @@ fn ready_condition(phase: &Phase) -> DriverCondition {
             "TensorlakeRunning",
             "Tensorlake sandbox is running".to_string(),
         ),
-        Phase::Suspended => (
+        Phase::Stopped => (
             "False",
-            "Suspended",
-            "Tensorlake sandbox is suspended; the Tensorlake driver cannot resume it yet"
-                .to_string(),
+            "Stopped",
+            "Tensorlake VMs are suspended; start the sandbox to resume them".to_string(),
         ),
         Phase::Failed { reason, message } => ("False", reason.as_str(), message.clone()),
         Phase::Deleting => (
@@ -137,13 +186,7 @@ fn ready_condition(phase: &Phase) -> DriverCondition {
             "Tensorlake sandbox is being deleted".to_string(),
         ),
     };
-    DriverCondition {
-        r#type: "Ready".to_string(),
-        status: status.to_string(),
-        reason: reason.to_string(),
-        message,
-        transition_time: None,
-    }
+    condition("Ready", status, reason, message)
 }
 
 /// Tensorlake sandbox name for an `OpenShell` sandbox ID.
@@ -537,6 +580,7 @@ impl TensorlakeComputeDriver {
             phase: Phase::Pending,
             launcher_pid: None,
             guard_launcher_pid: None,
+            launch: 0,
         };
         self.records
             .lock()
@@ -545,23 +589,229 @@ impl TensorlakeComputeDriver {
         self.emit_sandbox(&record);
         self.publish_progress(&sandbox.id, LaunchProgress::Accepted);
 
-        let driver = self.clone();
-        let sandbox = sandbox.clone();
-        tokio::spawn(async move {
-            if let Err(message) = driver
-                .provision(
-                    &sandbox,
-                    &created.sandbox_id,
-                    &guard_tensorlake_id,
-                    &identity,
-                )
+        self.spawn_launch(Launch {
+            sandbox: sandbox.clone(),
+            tensorlake_id: created.sandbox_id,
+            guard_tensorlake_id,
+            identity,
+            id: 0,
+            resume: false,
+        });
+        Ok(())
+    }
+
+    /// Stop the sandbox: end the launched processes in both VMs, then
+    /// suspend the VMs. Their disks stay. Safe to call again; a VM that is
+    /// already suspended is left alone.
+    pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), Status> {
+        let record = {
+            let mut records = self.records.lock().await;
+            let Some(record) = records.get_mut(sandbox_id) else {
+                return Err(Status::not_found("sandbox not found"));
+            };
+            if record.phase == Phase::Deleting {
+                return Err(Status::failed_precondition("sandbox is being deleted"));
+            }
+            // Take the launch away from a provisioning task first, so it
+            // cannot start a launcher after the VM was stopped.
+            record.launch += 1;
+            record.launcher_pid = None;
+            record.guard_launcher_pid = None;
+            record.phase = Phase::Stopped;
+            record.clone()
+        };
+        self.emit_sandbox(&record);
+        for (tensorlake_id, role) in [
+            (&record.tensorlake_id, "workload"),
+            (&record.guard_tensorlake_id, "guard"),
+        ] {
+            if tensorlake_id.is_empty() {
+                continue;
+            }
+            self.stop_vm(sandbox_id, tensorlake_id, role)
                 .await
-            {
-                warn!(sandbox_id = %sandbox.id, %message, "Tensorlake sandbox launch failed");
-                driver.publish_progress(&sandbox.id, LaunchProgress::Failed(&message));
+                .map_err(Status::unavailable)?;
+        }
+        info!(sandbox_id, "Stopped Tensorlake sandbox");
+        Ok(())
+    }
+
+    /// End the generation in one VM and suspend it.
+    async fn stop_vm(
+        &self,
+        sandbox_id: &str,
+        tensorlake_id: &str,
+        role: &str,
+    ) -> Result<(), String> {
+        let started = Instant::now();
+        loop {
+            let info = match self.client.get_sandbox(tensorlake_id).await {
+                Ok(info) => info,
+                // The poll loop reports a lost VM; stop has nothing to do.
+                Err(TensorlakeError::NotFound) => return Ok(()),
+                Err(error) => return Err(format!("get Tensorlake {role} sandbox: {error}")),
+            };
+            match info.status.as_str() {
+                "running" => {
+                    self.end_generation(sandbox_id, &info, role).await?;
+                    self.client
+                        .suspend_sandbox(tensorlake_id)
+                        .await
+                        .map_err(|error| format!("suspend Tensorlake {role} sandbox: {error}"))?;
+                    info!(sandbox_id, tensorlake_sandbox_id = %tensorlake_id, role, "Suspended Tensorlake sandbox");
+                    return Ok(());
+                }
+                // A VM that is still booting or resuming: wait, then stop it.
+                "pending" | "snapshotting" => {}
+                // Already suspended, or terminated (the poll loop reports it).
+                _ => return Ok(()),
+            }
+            if started.elapsed() > STOP_TIMEOUT {
+                return Err(format!(
+                    "Tensorlake {role} sandbox stayed '{}' for too long to stop it",
+                    info.status
+                ));
+            }
+            tokio::time::sleep(self.config.poll_interval).await;
+        }
+    }
+
+    /// Run the launcher's `--stop` in a running VM and wait for it to
+    /// finish. A failed run is logged; the next launch cleans up again.
+    async fn end_generation(
+        &self,
+        sandbox_id: &str,
+        info: &SandboxInfo,
+        role: &str,
+    ) -> Result<(), String> {
+        let stop = self
+            .client
+            .start_process(
+                info,
+                &StartProcessRequest {
+                    command: launch::LAUNCHER_PATH.to_string(),
+                    args: vec![launch::LAUNCHER_STOP_ARG.to_string()],
+                    env: std::collections::BTreeMap::new(),
+                    user: "root".to_string(),
+                    stdin_mode: "closed",
+                },
+            )
+            .await
+            .map_err(|error| format!("stop the OpenShell {role} generation: {error}"))?;
+        let started = Instant::now();
+        loop {
+            match self.client.get_process(info, stop.pid).await {
+                Ok(Some(process)) if process.is_running() => {}
+                Ok(Some(process)) => {
+                    if process.exit_code != Some(0) {
+                        warn!(
+                            sandbox_id,
+                            role,
+                            outcome = %process.outcome(),
+                            "OpenShell launcher stop run did not finish cleanly"
+                        );
+                    }
+                    return Ok(());
+                }
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    return Err(format!("wait for the OpenShell {role} stop run: {error}"));
+                }
+            }
+            if started.elapsed() > END_GENERATION_TIMEOUT {
+                warn!(
+                    sandbox_id,
+                    role, "OpenShell launcher stop run is still running; suspending anyway"
+                );
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// Start a stopped sandbox: resume both VMs and launch a new generation
+    /// with the fresh credentials. Returns at once; a background task does
+    /// the work, as for create. A sandbox that is launching or running is
+    /// left alone, so a retried start is harmless.
+    pub async fn start_sandbox(
+        &self,
+        sandbox_id: &str,
+        launch_authentication: Vec<u8>,
+    ) -> Result<(), Status> {
+        if launch_authentication.is_empty() {
+            return Err(Status::failed_precondition(
+                "Tensorlake sandboxes require launch-scoped gateway authentication",
+            ));
+        }
+        let (launch, record) = {
+            let mut records = self.records.lock().await;
+            let Some(record) = records.get_mut(sandbox_id) else {
+                return Err(Status::not_found("sandbox not found"));
+            };
+            match &record.phase {
+                Phase::Stopped => {}
+                Phase::Pending | Phase::Launching | Phase::Running => return Ok(()),
+                Phase::Deleting => {
+                    return Err(Status::failed_precondition("sandbox is being deleted"));
+                }
+                Phase::Failed { message, .. } => {
+                    return Err(Status::failed_precondition(format!(
+                        "sandbox cannot be started: {message}"
+                    )));
+                }
+            }
+            if record.guard_tensorlake_id.is_empty() {
+                return Err(Status::failed_precondition(
+                    "the guard VM of this sandbox is gone; delete and recreate it",
+                ));
+            }
+            let Some(spec) = record.sandbox.spec.as_mut() else {
+                return Err(Status::failed_precondition(
+                    "no saved request for this sandbox; delete and recreate it",
+                ));
+            };
+            spec.launch_authentication = launch_authentication;
+            let identity = match record.identity.clone() {
+                Some(identity) => identity,
+                None => launch::resolve_identity(&record.sandbox, &self.image_for(&record.sandbox))
+                    .map_err(Status::failed_precondition)?,
+            };
+            record.identity = Some(identity.clone());
+            record.launch += 1;
+            record.phase = Phase::Pending;
+            let launch = Launch {
+                sandbox: record.sandbox.clone(),
+                tensorlake_id: record.tensorlake_id.clone(),
+                guard_tensorlake_id: record.guard_tensorlake_id.clone(),
+                identity,
+                id: record.launch,
+                resume: true,
+            };
+            // The stored copy never holds the credentials.
+            if let Some(spec) = record.sandbox.spec.as_mut() {
+                spec.launch_authentication.clear();
+            }
+            (launch, record.clone())
+        };
+        self.emit_sandbox(&record);
+        self.publish_progress(sandbox_id, LaunchProgress::Resuming);
+        self.spawn_launch(launch);
+        Ok(())
+    }
+
+    /// Run a launch in the background and record its failure.
+    fn spawn_launch(&self, launch: Launch) {
+        let driver = self.clone();
+        tokio::spawn(async move {
+            let sandbox_id = launch.sandbox.id.clone();
+            let launch_id = launch.id;
+            if let Err(message) = driver.launch(launch).await {
+                warn!(sandbox_id = %sandbox_id, %message, "Tensorlake sandbox launch failed");
+                driver.publish_progress(&sandbox_id, LaunchProgress::Failed(&message));
                 driver
-                    .set_phase(
-                        &sandbox.id,
+                    .set_launch_phase(
+                        &sandbox_id,
+                        launch_id,
                         Phase::Failed {
                             reason: "LaunchFailed".into(),
                             message,
@@ -570,7 +820,66 @@ impl TensorlakeComputeDriver {
                     .await;
             }
         });
-        Ok(())
+    }
+
+    async fn launch(&self, launch: Launch) -> Result<(), String> {
+        if launch.resume {
+            for (tensorlake_id, role) in [
+                (&launch.tensorlake_id, "workload"),
+                (&launch.guard_tensorlake_id, "guard"),
+            ] {
+                if !self.owns_launch(&launch.sandbox.id, launch.id).await {
+                    return Ok(());
+                }
+                self.resume_vm(tensorlake_id, role).await?;
+            }
+        }
+        self.provision(
+            &launch.sandbox,
+            &launch.tensorlake_id,
+            &launch.guard_tensorlake_id,
+            &launch.identity,
+            launch.id,
+        )
+        .await
+    }
+
+    /// Ask Tensorlake to resume a suspended VM. A VM that is still
+    /// suspending is resumed once it is suspended. A running VM, for example
+    /// one resumed by hand, needs nothing.
+    async fn resume_vm(&self, tensorlake_id: &str, role: &str) -> Result<(), String> {
+        let started = Instant::now();
+        loop {
+            let info = self
+                .client
+                .get_sandbox(tensorlake_id)
+                .await
+                .map_err(|error| format!("get Tensorlake {role} sandbox: {error}"))?;
+            match info.status.as_str() {
+                "suspended" => {
+                    self.client
+                        .resume_sandbox(tensorlake_id)
+                        .await
+                        .map_err(|error| format!("resume Tensorlake {role} sandbox: {error}"))?;
+                    info!(tensorlake_sandbox_id = %tensorlake_id, role, "Resumed Tensorlake sandbox");
+                    return Ok(());
+                }
+                "running" | "pending" | "snapshotting" => return Ok(()),
+                "suspending" => {}
+                other => {
+                    return Err(format!(
+                        "Tensorlake {role} sandbox is '{other}' and cannot be resumed{}",
+                        failure_detail(&info)
+                    ));
+                }
+            }
+            if started.elapsed() > STOP_TIMEOUT {
+                return Err(format!(
+                    "Tensorlake {role} sandbox stayed 'suspending' for too long to resume it"
+                ));
+            }
+            tokio::time::sleep(self.config.poll_interval).await;
+        }
     }
 
     /// Wait for the VMs, upload the launch bundles, and start the launchers.
@@ -580,21 +889,26 @@ impl TensorlakeComputeDriver {
         tensorlake_id: &str,
         guard_tensorlake_id: &str,
         identity: &ResolvedWorkloadIdentity,
+        launch: u64,
     ) -> Result<(), String> {
         let started = Instant::now();
         let Some(workload_info) = self
-            .wait_running(sandbox, tensorlake_id, "workload", started)
+            .wait_running(sandbox, tensorlake_id, "workload", started, launch)
             .await?
         else {
             return Ok(());
         };
         let Some(guard_info) = self
-            .wait_running(sandbox, guard_tensorlake_id, "guard", started)
+            .wait_running(sandbox, guard_tensorlake_id, "guard", started, launch)
             .await?
         else {
             return Ok(());
         };
-        self.set_phase(&sandbox.id, Phase::Launching).await;
+        if !self.owns_launch(&sandbox.id, launch).await {
+            return Ok(());
+        }
+        self.set_launch_phase(&sandbox.id, launch, Phase::Launching)
+            .await;
         self.publish_progress(&sandbox.id, LaunchProgress::VmRunning);
         self.publish_progress(&sandbox.id, LaunchProgress::UploadingBundle);
 
@@ -614,16 +928,26 @@ impl TensorlakeComputeDriver {
             .write_file(&guard_info, launch::BUNDLE_UPLOAD_PATH, bundles.guard)
             .await
             .map_err(|error| format!("upload guard launch bundle: {error}"))?;
+        if !self.owns_launch(&sandbox.id, launch).await {
+            return Ok(());
+        }
         self.publish_progress(&sandbox.id, LaunchProgress::StartingLauncher);
         let guard_launcher_pid = self.start_launcher(sandbox, &guard_info, "guard").await?;
         let launcher_pid = self
             .start_launcher(sandbox, &workload_info, "workload")
             .await?;
-        if let Some(record) = self.records.lock().await.get_mut(&sandbox.id) {
+        if let Some(record) = self
+            .records
+            .lock()
+            .await
+            .get_mut(&sandbox.id)
+            .filter(|record| record.launch == launch)
+        {
             record.launcher_pid = Some(launcher_pid);
             record.guard_launcher_pid = Some(guard_launcher_pid);
         }
-        self.set_phase(&sandbox.id, Phase::Running).await;
+        self.set_launch_phase(&sandbox.id, launch, Phase::Running)
+            .await;
         self.publish_progress(&sandbox.id, LaunchProgress::LauncherStarted);
         Ok(())
     }
@@ -636,10 +960,11 @@ impl TensorlakeComputeDriver {
         tensorlake_id: &str,
         role: &str,
         started: Instant,
+        launch: u64,
     ) -> Result<Option<SandboxInfo>, String> {
         let mut last_pending_reason: Option<String> = None;
         loop {
-            if !self.is_active(&sandbox.id).await {
+            if !self.owns_launch(&sandbox.id, launch).await {
                 return Ok(None);
             }
             let info = self
@@ -782,14 +1107,33 @@ impl TensorlakeComputeDriver {
         .chain(live)
     }
 
-    async fn is_active(&self, sandbox_id: &str) -> bool {
+    /// Whether `launch` is still the sandbox's current launch. A stop, a
+    /// start, or a delete ends a launch; its task then stops quietly.
+    async fn owns_launch(&self, sandbox_id: &str, launch: u64) -> bool {
         self.records
             .lock()
             .await
             .get(sandbox_id)
-            .is_some_and(|record| record.phase != Phase::Deleting)
+            .is_some_and(|record| record.phase != Phase::Deleting && record.launch == launch)
     }
 
+    /// Set the phase from a launch task. Ignored once the launch is over.
+    async fn set_launch_phase(&self, sandbox_id: &str, launch: u64, phase: Phase) {
+        let record = {
+            let mut records = self.records.lock().await;
+            let Some(record) = records.get_mut(sandbox_id) else {
+                return;
+            };
+            if record.phase == Phase::Deleting || record.launch != launch || record.phase == phase {
+                return;
+            }
+            record.phase = phase;
+            record.clone()
+        };
+        self.emit_sandbox(&record);
+    }
+
+    /// Set the phase from the poll loop.
     async fn set_phase(&self, sandbox_id: &str, phase: Phase) {
         let record = {
             let mut records = self.records.lock().await;
@@ -1019,6 +1363,7 @@ fn recovered_record(
         phase,
         launcher_pid: None,
         guard_launcher_pid: None,
+        launch: 0,
     })
 }
 
@@ -1037,10 +1382,12 @@ fn recovered_phase(workload: Option<&SandboxInfo>, guard: Option<&SandboxInfo>) 
     };
     Some(match (workload_phase, guard_phase) {
         (None, None) => return None,
-        (Some(Phase::Pending), _) | (_, Some(Phase::Pending)) => restarted(),
         (None, Some(_)) => half("workload"),
         (Some(_), None) => half("guard"),
-        (Some(Phase::Suspended), _) | (_, Some(Phase::Suspended)) => Phase::Suspended,
+        // A stopped sandbox, or a stop or start the restart interrupted.
+        // Start resumes what is suspended and launches again.
+        (Some(Phase::Stopped), _) | (_, Some(Phase::Stopped)) => Phase::Stopped,
+        (Some(Phase::Pending), _) | (_, Some(Phase::Pending)) => restarted(),
         (Some(phase), _) => phase,
     })
 }
@@ -1072,15 +1419,21 @@ fn reconcile(
         | Phase::Pending
         | Phase::Launching => return Reconcile::Keep,
         // A failed launch stays failed while the VMs still exist. Nothing
-        // will launch it again.
+        // will launch it again, unless both VMs are suspended: then the
+        // sandbox is stopped, and start launches it again.
         Phase::Failed { .. }
             if workload_phase
                 .as_ref()
-                .is_some_and(|phase| *phase != Phase::Suspended)
+                .is_some_and(|phase| *phase != Phase::Stopped)
                 && guard_phase
                     .as_ref()
-                    .is_some_and(|phase| *phase != Phase::Suspended) =>
+                    .is_some_and(|phase| *phase != Phase::Stopped) =>
         {
+            return Reconcile::Keep;
+        }
+        // A stopped sandbox stays stopped while its VMs exist, whatever
+        // their state: a VM resumed by hand runs nothing of OpenShell.
+        Phase::Stopped if workload_phase.is_some() && guard_phase.is_some() => {
             return Reconcile::Keep;
         }
         _ => {}
@@ -1097,9 +1450,8 @@ fn reconcile(
     match (workload_phase, guard_phase) {
         (None, _) => gone("workload", workload),
         (Some(_), None) => gone("guard", guard),
-        (Some(Phase::Suspended), _) | (_, Some(Phase::Suspended)) => {
-            Reconcile::Set(Phase::Suspended)
-        }
+        // A VM suspended by hand stops the sandbox. Start resumes it.
+        (Some(Phase::Stopped), _) | (_, Some(Phase::Stopped)) => Reconcile::Set(Phase::Stopped),
         (Some(next), _) => Reconcile::Set(next),
     }
 }
@@ -1128,7 +1480,7 @@ fn observed_phase(info: &SandboxInfo) -> Option<Phase> {
     match info.status.as_str() {
         "pending" => Some(Phase::Pending),
         "running" | "snapshotting" => Some(Phase::Running),
-        "suspending" | "suspended" => Some(Phase::Suspended),
+        "suspending" | "suspended" => Some(Phase::Stopped),
         _ => None,
     }
 }
@@ -1157,6 +1509,8 @@ fn failure_detail(info: &SandboxInfo) -> String {
 enum LaunchProgress<'a> {
     /// Tensorlake accepted the create request; the VM is not running yet.
     Accepted,
+    /// Start asked Tensorlake to resume the suspended VMs.
+    Resuming,
     /// Tensorlake reported why the VM is still pending.
     Pending(&'a str),
     /// The VM runs.
@@ -1178,6 +1532,11 @@ impl LaunchProgress<'_> {
                 "Normal",
                 "Accepted",
                 "Tensorlake accepted the sandbox request".to_string(),
+            ),
+            Self::Resuming => (
+                "Normal",
+                "Resuming",
+                "Resuming the Tensorlake VMs".to_string(),
             ),
             Self::Pending(reason) => (
                 "Normal",
@@ -1221,6 +1580,10 @@ impl LaunchProgress<'_> {
                 mark_progress_active(metadata, PROGRESS_STEP_REQUESTING_SANDBOX);
                 mark_progress_detail(metadata, "Waiting for the Tensorlake VM");
             }
+            Self::Resuming => {
+                mark_progress_active(metadata, PROGRESS_STEP_REQUESTING_SANDBOX);
+                mark_progress_detail(metadata, "Resuming the Tensorlake VMs");
+            }
             Self::Pending(reason) => {
                 mark_progress_active(metadata, PROGRESS_STEP_REQUESTING_SANDBOX);
                 mark_progress_detail(metadata, reason);
@@ -1254,6 +1617,19 @@ impl LaunchProgress<'_> {
         }
         event
     }
+}
+
+/// What a launch task needs. `sandbox` carries the launch credentials;
+/// the stored record does not.
+struct Launch {
+    sandbox: DriverSandbox,
+    tensorlake_id: String,
+    guard_tensorlake_id: String,
+    identity: ResolvedWorkloadIdentity,
+    /// The record's launch counter when this launch began.
+    id: u64,
+    /// Resume suspended VMs first (start), or expect new ones (create).
+    resume: bool,
 }
 
 fn sandbox_event(sandbox: DriverSandbox) -> WatchSandboxesEvent {
@@ -1377,6 +1753,40 @@ mod tests {
     }
 
     #[test]
+    fn stopped_and_starting_carry_their_conditions() {
+        let find = |conditions: &[DriverCondition], r#type: &str| {
+            conditions
+                .iter()
+                .find(|condition| condition.r#type == r#type)
+                .map(|condition| (condition.status.clone(), condition.reason.clone()))
+        };
+        let stopped = phase_conditions(&Phase::Stopped);
+        assert_eq!(
+            find(&stopped, "Ready"),
+            Some(("False".into(), "Stopped".into()))
+        );
+        assert_eq!(
+            find(&stopped, "Suspended"),
+            Some(("True".into(), "ComputeStopped".into()))
+        );
+        assert_eq!(find(&stopped, "Bootstrapping"), None);
+        for phase in [Phase::Pending, Phase::Launching] {
+            let starting = phase_conditions(&phase);
+            assert_eq!(
+                find(&starting, "Bootstrapping"),
+                Some(("True".into(), "Starting".into()))
+            );
+            assert_eq!(find(&starting, "Suspended"), None);
+        }
+        let running = phase_conditions(&Phase::Running);
+        assert_eq!(running.len(), 1);
+        assert_eq!(
+            find(&running, "Ready"),
+            Some(("True".into(), "TensorlakeRunning".into()))
+        );
+    }
+
+    #[test]
     fn ready_condition_maps_phases() {
         assert_eq!(ready_condition(&Phase::Running).status, "True");
         let pending = ready_condition(&Phase::Pending);
@@ -1448,12 +1858,24 @@ mod tests {
         );
         assert_eq!(
             reconcile(&Phase::Running, Some(&info("suspended")), Some(&guard)),
-            Reconcile::Set(Phase::Suspended)
+            Reconcile::Set(Phase::Stopped)
         );
-        assert_eq!(
-            reconcile(&Phase::Suspended, Some(&info("running")), Some(&guard)),
-            Reconcile::Set(Phase::Running)
-        );
+        // A stopped sandbox stays stopped until start launches it again,
+        // even when someone resumes a VM by hand.
+        for workload in ["suspending", "suspended", "pending", "running"] {
+            assert_eq!(
+                reconcile(&Phase::Stopped, Some(&info(workload)), Some(&guard)),
+                Reconcile::Keep
+            );
+        }
+        assert!(matches!(
+            reconcile(&Phase::Stopped, None, Some(&guard)),
+            Reconcile::Set(Phase::Failed { reason, .. }) if reason == "TensorlakeTerminated"
+        ));
+        assert!(matches!(
+            reconcile(&Phase::Stopped, Some(&info("suspended")), None),
+            Reconcile::Set(Phase::Failed { reason, .. }) if reason == "TensorlakeTerminated"
+        ));
         assert!(matches!(
             reconcile(&Phase::Running, Some(&info("terminated")), Some(&guard)),
             Reconcile::Set(Phase::Failed { reason, .. }) if reason == "TensorlakeTerminated"
@@ -1483,10 +1905,19 @@ mod tests {
         };
         assert_eq!(reason, "TensorlakeTerminated");
         assert!(message.contains("guard"));
-        // A suspended guard VM suspends the sandbox.
+        // A suspended guard VM stops the sandbox.
         assert_eq!(
             reconcile(&Phase::Running, Some(&running), Some(&suspended)),
-            Reconcile::Set(Phase::Suspended)
+            Reconcile::Set(Phase::Stopped)
+        );
+        // A failed sandbox whose VMs were suspended can be started again.
+        let failed = Phase::Failed {
+            reason: "LauncherExited".into(),
+            message: "m".into(),
+        };
+        assert_eq!(
+            reconcile(&failed, Some(&suspended), Some(&suspended)),
+            Reconcile::Set(Phase::Stopped)
         );
     }
 
@@ -1553,7 +1984,7 @@ mod tests {
         assert_eq!(status.conditions[0].reason, "TensorlakeRunning");
 
         // Without the saved request only the ID is known.
-        let record = recovered_record(id, None, None, Some(&guard), Phase::Suspended).unwrap();
+        let record = recovered_record(id, None, None, Some(&guard), Phase::Stopped).unwrap();
         assert_eq!(record.sandbox.id, id);
         assert!(record.sandbox.name.is_empty());
         assert_eq!(record.tensorlake_id, guard.sandbox_id);
@@ -1603,6 +2034,17 @@ mod tests {
             ),
             Some(Phase::Failed { reason, .. }) if reason == "DriverRestarted"
         ));
+        // Suspended VMs are a stopped sandbox, also with a stop or start
+        // half done.
+        for guard in ["suspended", "suspending", "running", "pending"] {
+            assert_eq!(
+                recovered_phase(
+                    Some(&named("openshell-f", "suspended")),
+                    Some(&named("openshell-f-guard", guard)),
+                ),
+                Some(Phase::Stopped)
+            );
+        }
         assert_eq!(
             recovered_phase(Some(&named("openshell-e", "terminated")), None),
             None
@@ -1711,7 +2153,8 @@ mod tests {
     #[test]
     fn observed_phase_treats_terminal_states_as_gone() {
         assert_eq!(observed_phase(&info("running")), Some(Phase::Running));
-        assert_eq!(observed_phase(&info("suspended")), Some(Phase::Suspended));
+        assert_eq!(observed_phase(&info("suspended")), Some(Phase::Stopped));
+        assert_eq!(observed_phase(&info("suspending")), Some(Phase::Stopped));
         for status in ["terminated", "failed", "timeout"] {
             assert_eq!(observed_phase(&info(status)), None);
         }

@@ -121,19 +121,24 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
-        required_id(&request.into_inner().sandbox_id)?;
-        Err(Status::unimplemented(
-            "the Tensorlake driver cannot stop a sandbox yet; delete it instead",
-        ))
+        let request = request.into_inner();
+        required_id(&request.sandbox_id)?;
+        self.driver.stop_sandbox(&request.sandbox_id).await?;
+        Ok(Response::new(StopSandboxResponse {}))
     }
 
     async fn start_sandbox(
         &self,
-        _request: Request<StartSandboxRequest>,
+        request: Request<StartSandboxRequest>,
     ) -> Result<Response<StartSandboxResponse>, Status> {
-        Err(Status::unimplemented(
-            "the Tensorlake driver cannot restart a sandbox yet",
-        ))
+        let request = request.into_inner();
+        required_id(&request.sandbox_id)?;
+        self.driver
+            .start_sandbox(&request.sandbox_id, request.launch_authentication)
+            .await?;
+        // The driver does not advertise sandbox authentication, so there is
+        // no runtime identity to return.
+        Ok(Response::new(StartSandboxResponse::default()))
     }
 
     async fn delete_sandbox(

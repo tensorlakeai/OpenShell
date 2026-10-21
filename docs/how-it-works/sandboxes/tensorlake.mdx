@@ -32,6 +32,10 @@ that carries the guard's connection to the workload VM. Every connection the
 agent makes travels over that channel to the guard, and the guard applies the
 policy. The agent's VM never holds a credential.
 
+`openshell sandbox stop` suspends both VMs. Tensorlake keeps their disks, so
+the workspace stays. `openshell sandbox start` resumes them with fresh
+credentials and starts the main process again.
+
 The guard dials the gateway from inside Tensorlake. The gateway must therefore
 be reachable from the internet, or at least from Tensorlake. A gateway on a
 laptop behind NAT does not work. The supported setup runs the gateway and the
@@ -195,19 +199,9 @@ Two things to know:
 - Anyone with access to that project can run `tl sbx exec --user root` in a
   guard VM and read its credentials. Project access is the trust boundary.
 
-## Limits
+## Scope
 
-- Stop and start are not supported. Delete the sandbox instead.
-- Workload identity accepts numeric user and group IDs only. The default is
-  `1000:1000`.
-- No GPU, `driver_config`, `platform_config`, or `agent_socket_path`.
-- The driver polls Tensorlake every few seconds. Status changes can lag by
-  that much.
-- After a driver restart, sandboxes that had not finished launching are
-  reported as failed. Running sandboxes are recovered from the saved
-  requests in `--state-dir`. Keep that directory with the gateway database.
-- Each sandbox uses two Tensorlake VMs. The guard VM defaults to 1 vCPU and
-  1 GiB.
+A single team with its own Tensorlake project can run it today.
 
 For build details, test results, and the design notes, see the
 [driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-tensorlake/README.md).

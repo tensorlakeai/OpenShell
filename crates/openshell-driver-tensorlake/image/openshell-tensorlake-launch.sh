@@ -23,9 +23,21 @@
 # The script extracts the bundle with the owners and modes the driver set,
 # deletes it, starts the role's processes, and stays in the foreground. It
 # exits when any process it started exits.
+#
+# A sandbox is stopped and started again in the same VMs. Before a launch,
+# the script ends the previous generation: it signals the previous script,
+# kills what is left in the workload namespace and under the unprivileged
+# identities, removes the namespace, and removes `/.openshell` and the
+# runtime directories. The workspace stays. `--stop` does only that and
+# exits, so the driver can end a generation before it suspends the VM.
 
 set -euo pipefail
 
+STOP_ONLY=0
+if [ "${1:-}" = "--stop" ]; then
+    STOP_ONLY=1
+    shift
+fi
 BUNDLE="${1:-/var/lib/openshell/launch-bundle.tar}"
 BIN_DIR=/opt/openshell/bin
 PARAMS=/.openshell/launch/params
@@ -40,6 +52,11 @@ VETH_HOST_ADDR=169.254.77.1
 VETH_WORKLOAD_ADDR=169.254.77.2
 BOOTSTRAP=/.openshell/channel/sandbox/bootstrap.json
 WORKLOAD_RESOLV_CONF=/.openshell/launch/resolv.conf
+LAUNCH_PID=/.openshell/launch/pid
+# Identities the launcher starts processes as, and the directories it
+# creates outside /.openshell. The previous generation is ended by these.
+LAUNCH_UIDS=/.openshell/launch/uids
+RUN_DIRS=(/run/openshell /run/openshell-tunnel /run/openshell-supervisor-ca)
 
 log() {
     printf '[openshell-tensorlake-launch] %s\n' "$*" >&2
@@ -51,15 +68,88 @@ fatal() {
 }
 
 [ "$(id -u)" -eq 0 ] || fatal "must run as root"
+
+# Wait up to $2 seconds for the PIDs in $1 to exit.
+wait_gone() {
+    local pids="$1" deadline=$(($(date +%s) + $2)) pid alive
+    while :; do
+        alive=0
+        for pid in $pids; do
+            kill -0 "$pid" 2>/dev/null && alive=1
+        done
+        [ "$alive" -eq 0 ] && return 0
+        [ "$(date +%s)" -ge "$deadline" ] && return 1
+        sleep 0.2
+    done
+}
+
+# PIDs of every process that runs as one of the UIDs in $*.
+pids_of_uids() {
+    local status pid uid
+    for status in /proc/[0-9]*/status; do
+        pid="${status#/proc/}"
+        pid="${pid%/status}"
+        [ "$pid" -eq "$$" ] && continue
+        uid="$(awk '/^Uid:/ {print $2; exit}' "$status" 2>/dev/null || true)"
+        [ -n "$uid" ] || continue
+        for wanted in "$@"; do
+            if [ "$uid" = "$wanted" ]; then
+                printf '%s\n' "$pid"
+            fi
+        done
+    done
+    # The last test above may fail; that is not an error for `set -e`.
+    return 0
+}
+
+# End the previous generation, if there is one, and remove its state.
+stop_previous() {
+    local pids
+    [ -e /.openshell ] || return 0
+    log "stopping the previous OpenShell generation"
+    if [ -f "$LAUNCH_PID" ]; then
+        pids="$(cat "$LAUNCH_PID" 2>/dev/null || true)"
+        if [ -n "$pids" ] && kill -0 "$pids" 2>/dev/null; then
+            # The previous script's trap ends what it started.
+            kill -TERM "$pids" 2>/dev/null || true
+            wait_gone "$pids" 10 || kill -KILL "$pids" 2>/dev/null || true
+        fi
+    fi
+    if ip netns list 2>/dev/null | grep -q "^${WORKLOAD_NETNS}\( \|$\)"; then
+        pids="$(ip netns pids "$WORKLOAD_NETNS" 2>/dev/null | tr '\n' ' ' || true)"
+        if [ -n "$pids" ]; then
+            # shellcheck disable=SC2086
+            kill -KILL $pids 2>/dev/null || true
+            wait_gone "$pids" 10 || log "processes in $WORKLOAD_NETNS did not exit"
+        fi
+        ip netns delete "$WORKLOAD_NETNS" || log "cannot delete $WORKLOAD_NETNS"
+    fi
+    if [ -f "$LAUNCH_UIDS" ]; then
+        # shellcheck disable=SC2046
+        pids="$(pids_of_uids $(cat "$LAUNCH_UIDS") | tr '\n' ' ' || true)"
+        if [ -n "$pids" ]; then
+            # shellcheck disable=SC2086
+            kill -TERM $pids 2>/dev/null || true
+            # shellcheck disable=SC2086
+            wait_gone "$pids" 5 || kill -KILL $pids 2>/dev/null || true
+        fi
+    fi
+    rm -rf /.openshell "${RUN_DIRS[@]}"
+    log "previous generation stopped"
+}
+
+stop_previous
+if [ "$STOP_ONLY" -eq 1 ]; then
+    exit 0
+fi
+
 [ -f "$BUNDLE" ] || fatal "launch bundle $BUNDLE is missing"
 
 umask 077
 chmod 0600 "$BUNDLE"
-if [ -e /.openshell ]; then
-    fatal "/.openshell already exists; this sandbox was already launched"
-fi
 tar --extract --file "$BUNDLE" --directory / --same-owner --same-permissions --numeric-owner
 rm -f "$BUNDLE"
+printf '%s\n' "$$" >"$LAUNCH_PID"
 
 # Read launch parameters (KEY=VALUE, numeric values and absolute paths).
 ROLE=""
@@ -106,6 +196,16 @@ cleanup() {
     done
 }
 trap cleanup EXIT
+# A stop arrives as SIGTERM. `wait` returns at once, the EXIT trap ends
+# the started processes, and the script exits.
+trap 'exit 143' TERM INT
+
+# Record the identities this generation runs as, so the next launch can
+# end what is left of it.
+case "$ROLE" in
+    workload) printf '%s\n' "$WORKLOAD_UID" "$FORWARDER_UID" >"$LAUNCH_UIDS" ;;
+    guard) printf '%s\n' "$SUPERVISOR_UID" "$TUNNEL_UID" >"$LAUNCH_UIDS" ;;
+esac
 
 # Workload runtime, in private network, mount, and PID namespaces. The
 # network namespace has loopback and one veth link to this VM, over which
