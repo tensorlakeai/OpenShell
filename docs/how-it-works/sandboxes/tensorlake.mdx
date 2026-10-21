@@ -63,8 +63,10 @@ public URL. The proxy terminates TLS.
 
 1. Choose an image pair. Use a published pair, or build your own from a
    source checkout with `crates/openshell-driver-tensorlake/build-images.sh`.
-   The control image records the name of its sandbox image, so the two always
-   match.
+   A published pair is named after the OpenShell version it holds, for
+   example `openshell-control-0-1-6` and `openshell-tensorlake-0-1-6` for
+   v0.1.6. Pick the pair that matches your CLI version. The control image
+   records the name of its sandbox image, so the two always match.
 
 2. Deploy. The script creates the control sandbox, exposes port 8080, uploads
    the settings, and starts the control plane as a managed process that

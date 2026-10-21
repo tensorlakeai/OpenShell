@@ -8,8 +8,11 @@ name: Tensorlake Images
 # Docker builds, so this job needs only the `tl` CLI and an API key.
 #
 # Run it by hand. A build with `public: true` registers the pair for every
-# Tensorlake project under a versioned name. Public names are permanent, so
-# pick a version that is not registered yet.
+# Tensorlake project under a versioned name. The version comes from the
+# checkout: run the workflow from a release tag to publish that release
+# (v0.1.6 -> openshell-tensorlake-0-1-6), or from a branch to publish a
+# build named after its short commit. Public names are permanent. Set
+# `version` only when you need a name the checkout does not give you.
 #
 # Required secret: TENSORLAKE_API_KEY, a key for the Tensorlake project that
 # owns the images.
@@ -18,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Image version suffix, for example 0-1-5. Required for a public build."
+        description: "Image version suffix. Default: the release tag on the checkout as 0-1-6, or the short commit."
         required: false
         type: string
         default: ""
@@ -48,6 +51,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The build script names a public pair after the release tag on HEAD.
+          fetch-tags: true
 
       - name: Check inputs
         env:
@@ -55,10 +60,6 @@ jobs:
           PUBLIC: ${{ inputs.public }}
         run: |
           set -euo pipefail
-          if [ "${PUBLIC}" = "true" ] && [ -z "${VERSION}" ]; then
-            echo "::error::a public build needs a version" >&2
-            exit 1
-          fi
           if [ -n "${VERSION}" ] && ! [[ "${VERSION}" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
             echo "::error::version must contain only lowercase letters, digits, and dashes" >&2
             exit 1

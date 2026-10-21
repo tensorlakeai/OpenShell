@@ -240,22 +240,31 @@ a new image on top of it.
 Build from a clean checkout, in the project that owns the public images:
 
 ```shell
-PUBLIC=1 VERSION=0-1-5 crates/openshell-driver-tensorlake/build-images.sh
+PUBLIC=1 crates/openshell-driver-tensorlake/build-images.sh
 ```
 
-This registers `openshell-tensorlake-0-1-5` and `openshell-control-0-1-5`
-as public images. Any Tensorlake project can use them without a build.
-Public names must be unique across all of Tensorlake, and Tensorlake has no
-image tags, so the version is part of the name. Do not replace a published
-version. Publish a new one.
+The script names the pair after the checkout, so a reader can tell what an
+image holds and no two publishes share a name:
+
+| Checkout | Sandbox image | Control image |
+|---|---|---|
+| Release tag `v0.1.6` | `openshell-tensorlake-0-1-6` | `openshell-control-0-1-6` |
+| Prerelease tag `v0.1.6-pre.2` | `openshell-tensorlake-0-1-6-pre-2` | `openshell-control-0-1-6-pre-2` |
+| Any other commit | `openshell-tensorlake-<short commit>` | `openshell-control-<short commit>` |
+
+Any Tensorlake project can use a public pair without a build. Public names
+must be unique across all of Tensorlake, and Tensorlake has no image tags,
+so the version is part of the name. Do not replace a published version.
+Publish a new one. Set `VERSION` only when you need a name the checkout
+does not give you.
 
 The images contain no keys. The control plane creates its signing keys at
 first start, and `deploy.sh` uploads the Tensorlake key at deploy time.
 
 The same build runs in CI from the `Tensorlake Images` workflow
-(`.github/workflows/tensorlake-images.yml`). Start it by hand with a version
-and the `public` flag. It needs the `TENSORLAKE_API_KEY` repository secret for
-the project that owns the public images.
+(`.github/workflows/tensorlake-images.yml`). Start it by hand from a release
+tag or a branch with the `public` flag. It needs the `TENSORLAKE_API_KEY`
+repository secret for the project that owns the public images.
 
 ## Run the driver
 
@@ -654,10 +663,11 @@ run above used `openshell-tensorlake-test`.
 
 ### 2. Publish the first public image pair
 
-Run the `Tensorlake Images` workflow with a version and `public: true`, or
-run `PUBLIC=1 VERSION=<version> build-images.sh` from a clean checkout in
-the project that owns the public images. Publish from a commit whose
-tests passed, because a published version cannot be replaced.
+Run the `Tensorlake Images` workflow from a release tag with `public: true`,
+or run `PUBLIC=1 build-images.sh` from a clean checkout of that tag in the
+project that owns the public images. The pair takes its name from the tag.
+Publish from a commit whose tests passed, because a published version
+cannot be replaced.
 
 ### 3. Later
 

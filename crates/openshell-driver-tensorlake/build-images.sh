@@ -10,21 +10,20 @@
 # work as a pair.
 #
 # Optional:
-#   VERSION         added to the default names as `-<VERSION>` (for example 0-1-5)
-#   SANDBOX_IMAGE   full sandbox image name (default: openshell-tensorlake[-VERSION])
-#   CONTROL_IMAGE   full control image name (default: openshell-control[-VERSION])
 #   PUBLIC=1        publish both images to all Tensorlake projects. The
 #                   checkout must be clean, so the images match a commit.
+#   VERSION         added to the default names as `-<VERSION>`. A public
+#                   build without VERSION takes it from the checkout: the
+#                   release tag on HEAD with dots turned into dashes
+#                   (v0.1.6-pre.2 -> 0-1-6-pre-2), or else the short commit
+#                   hash. So a published pair is named after what it holds.
+#   SANDBOX_IMAGE   full sandbox image name (default: openshell-tensorlake[-VERSION])
+#   CONTROL_IMAGE   full control image name (default: openshell-control[-VERSION])
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${HERE}/../.." && pwd)"
-# VERSION changes only the default names. Names set in SANDBOX_IMAGE or
-# CONTROL_IMAGE are used as they are.
-SUFFIX="${VERSION:+-${VERSION}}"
-SANDBOX_IMAGE="${SANDBOX_IMAGE:-openshell-tensorlake${SUFFIX}}"
-CONTROL_IMAGE="${CONTROL_IMAGE:-openshell-control${SUFFIX}}"
 SOURCE_PATHS=(Cargo.toml Cargo.lock rust-toolchain.toml crates proto providers)
 
 command -v tl >/dev/null || { echo "error: the tl CLI is not installed" >&2; exit 1; }
@@ -41,6 +40,27 @@ COMMIT="$(git -C "${ROOT}" rev-parse HEAD)"
 if [ -n "$(git -C "${ROOT}" status --porcelain -- "${SOURCE_PATHS[@]}")" ]; then
     COMMIT="${COMMIT}-dirty"
 fi
+
+# A public build is named after its source, so no two publishes share a
+# name and a reader can tell what an image holds. Tensorlake has no image
+# tags, so the version is part of the name.
+if [ -z "${VERSION:-}" ] && [ "${PUBLIC:-}" = "1" ]; then
+    if TAG="$(git -C "${ROOT}" describe --tags --exact-match --match 'v[0-9]*' HEAD 2>/dev/null)"; then
+        VERSION="${TAG#v}"
+        VERSION="${VERSION//./-}"
+    else
+        VERSION="$(git -C "${ROOT}" rev-parse --short=7 HEAD)"
+    fi
+fi
+if [ -n "${VERSION:-}" ] && ! [[ "${VERSION}" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    echo "error: VERSION must contain only lowercase letters, digits, and dashes: ${VERSION}" >&2
+    exit 1
+fi
+# VERSION changes only the default names. Names set in SANDBOX_IMAGE or
+# CONTROL_IMAGE are used as they are.
+SUFFIX="${VERSION:+-${VERSION}}"
+SANDBOX_IMAGE="${SANDBOX_IMAGE:-openshell-tensorlake${SUFFIX}}"
+CONTROL_IMAGE="${CONTROL_IMAGE:-openshell-control${SUFFIX}}"
 
 CONTEXT="$(mktemp -d)"
 trap 'rm -rf "${CONTEXT}"' EXIT
@@ -77,6 +97,7 @@ cat <<EOF
 Registered:
   sandbox image: ${SANDBOX_IMAGE}
   control image: ${CONTROL_IMAGE}
+  version: ${VERSION:-(none)}
   source commit: ${COMMIT}
 
 Deploy:
