@@ -387,8 +387,8 @@ A public gateway is inherent to a remote sandbox provider. Guards in
 sandbox VMs must dial the gateway, they cannot hold a Tensorlake key, and
 Tensorlake has no inbound tunnel to your machine. So port 8080 must accept
 calls from anyone, and the URL is public in every mode. You cannot hide it.
-The decision and the fallback for deployments without an identity provider
-are in [docs/control-plane-auth.md](docs/control-plane-auth.md).
+A deployment without an identity provider could use mTLS over a Tensorlake
+tunnel instead, but that is not implemented.
 
 The login is what makes the public URL safe. The gateway checks every call
 for a valid login token from your login service. It checks the token's
@@ -551,47 +551,91 @@ no longer grants it.
 
 This section is a temporary plan. Remove it once the work is done.
 
-### 1. Case study: run Claude Code on Tensorlake through OpenShell
+### 1. Case study: run OpenCode on Tensorlake through OpenShell
 
-The hello test proves the plumbing. The case study proves the three things
-a real user needs: the guard injects a real provider credential, the policy
-blocks a real agent's stray traffic, and a custom agent image works. The
-`--from` flag on sandbox create maps to a Tensorlake image name, so the
-driver already supports this.
+The hello test proves the plumbing. The case study proves what a real user
+needs: a custom agent image works, the guard injects a real provider
+credential, the policy blocks a real agent's stray traffic, and stop and
+start keep the agent's files. It follows
+[Run your first agent](../../docs/about/run-your-first-agent.mdx), with
+OpenCode and the free OpenRouter model, so a viewer needs no paid key.
 
-Build a derived image on Tensorlake. Its Dockerfile starts
-`FROM openshell-tensorlake-test` and installs Claude Code. Register it:
+The `--from` flag on sandbox create maps to a Tensorlake image name. The
+guard VM always uses the driver's guard image. The workload VM uses the
+`--from` image, and it needs the launch script, the workload runtime,
+`socat`, and `iproute2` from it.
+
+Tensorlake can import a public OCI image by reference, with
+`tl sbx image import ghcr.io/anomalyco/opencode:latest`. That import
+works, but the sandbox does not: the launch fails with `LaunchFailed`
+because `/opt/openshell/bin/openshell-tensorlake-launch` is not in the
+image (tested 2026-10-21). So the agent image must be built on the
+sandbox image. The build runs on Tensorlake, so you still need no Docker
+on your machine.
+
+**Build the image.** The Dockerfile in `examples/opencode/` starts from
+the sandbox image and installs the OpenCode release binary at the path
+named in the `binaries` list of `providers/openrouter.yaml`. It takes the
+glibc build from GitHub, not the binary from `ghcr.io/anomalyco/opencode`:
+that image is Alpine, and its binary needs the musl loader, which the
+Ubuntu base does not have (tested 2026-10-21, `cannot execute: required
+file not found`).
 
 ```shell
-tl sbx image create path/to/Dockerfile \
-  --registered-name openshell-tensorlake-claude --cas
+tl sbx image create crates/openshell-driver-tensorlake/examples/opencode/Dockerfile \
+  --registered-name openshell-tensorlake-opencode --cas
 ```
 
-Import the provider profile and create the provider. The API key stays in
-the gateway and never enters the workload:
+The build takes about a minute. The binary runs on the base, and OpenCode
+writes its config and database under `/sandbox`, the workload's home.
+
+**Create the provider.** The key stays in the gateway and the guard VM. It
+never enters the workload VM:
 
 ```shell
-openshell profile import --file providers/claude-code.yaml
-export ANTHROPIC_API_KEY=your_api_key
-openshell provider create --name anthropic --type anthropic --from-existing
+openshell profile import --file providers/openrouter.yaml
+export OPENROUTER_API_KEY=your_api_key
+openshell provider create --name openrouter --type openrouter --from-existing
 ```
 
-Run the agent:
+**Run the agent:**
 
 ```shell
 openshell sandbox create --name demo \
-  --from openshell-tensorlake-claude \
-  --provider anthropic \
-  -- claude -p "write a hello world in python and run it"
+  --from openshell-tensorlake-opencode \
+  --provider openrouter \
+  -- opencode -m openrouter/nvidia/nemotron-3.5-lightning:free
 ```
 
-Then show one denied request, for example the agent reaching PyPI. Approve
-the drafted policy rule and run again.
+**Show the four things.** Record these in order. All four were run on
+2026-10-21 against the test control plane, with the sandbox image
+`openshell-tensorlake-test` and the free OpenRouter model.
 
-The output is a tutorial page under `docs/tutorials/`, modeled on
-"Run your first agent", plus a section in the design doc. The first run
-will hit denials for npm or PyPI. Budget time to settle the policy before
-you record the final run.
+1. Zero network in the agent VM. Run `openshell sandbox exec -n demo --
+   curl -sS https://example.com` and show the failure. Then run
+   `opencode run -m openrouter/nvidia/nemotron-3.5-lightning:free "reply
+   with OK"` and show the answer. The only path out is the guard.
+2. The credential is not in the agent VM. The workload sees
+   `OPENROUTER_API_KEY`, but its value is a placeholder that starts with
+   `openshell:`. The guard swaps in the real key on the way to
+   `openrouter.ai`. The workload cannot read `/.openshell`.
+3. One denied request and one approved rule. Ask OpenCode to run `curl
+   https://pypi.org/simple/requests/`. The connection fails. Within a few
+   seconds `openshell rule get demo --status pending` shows a drafted
+   rule for `pypi.org:443` from `/usr/bin/curl`, and two more for hosts
+   OpenCode tried on its own, `registry.npmjs.org` and
+   `models.opencode.ai`. Approve the PyPI rule with `openshell rule
+   approve demo --chunk-id <id>`. The rule reaches the sandbox in about
+   30 seconds, and the same curl then returns the page.
+4. Stop and start. Write a file, run `openshell sandbox stop demo`
+   (Stopped in about 10 s), then `openshell sandbox start demo` (Ready in
+   about 10 s). The file, the OpenCode database, and the approved rule
+   are all still there.
+
+The tutorial page is
+[Run OpenCode on Tensorlake](../../docs/tutorials/run-opencode-on-tensorlake.mdx).
+It uses the default image name `openshell-tensorlake` in `FROM`; the dev
+run above used `openshell-tensorlake-test`.
 
 ### 2. Publish the first public image pair
 

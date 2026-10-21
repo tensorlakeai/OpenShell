@@ -1,0 +1,275 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Run OpenCode on Tensorlake"
+sidebar-title: "OpenCode on Tensorlake"
+description: "Build an OpenCode image on Tensorlake, run it in an OpenShell sandbox with no local virtualization, and watch the guard mediate every connection."
+keywords: "Generative AI, Cybersecurity, Tutorial, OpenCode, OpenRouter, Tensorlake, MicroVM, Sandbox, Provider Profile"
+---
+
+In this tutorial, you'll run [OpenCode](https://opencode.ai), a terminal
+coding agent, inside an OpenShell sandbox on the
+[Tensorlake runtime](/how-it-works/sandboxes/tensorlake). Each sandbox gets two
+small virtual machines (VMs). The agent runs in one VM with no outbound
+network. The guard runs in the other VM, holds your API key, and applies the
+policy to every connection the agent makes.
+
+You'll build the image on Tensorlake, give OpenCode access to
+[OpenRouter](https://openrouter.ai), start the agent, and then confirm four
+things:
+
+- The agent VM has no network of its own.
+- The API key never enters the agent VM.
+- A denied request becomes an approved rule without a restart.
+- Stop and start keep the agent's files.
+
+The example uses a free OpenRouter model, so it works without credits.
+
+<Note>
+The Tensorlake driver is experimental. Read its
+[trust model](/how-it-works/sandboxes/tensorlake#trust-model) before you attach
+a credential you care about.
+</Note>
+
+## Prerequisites
+
+You'll need:
+
+- A Tensorlake account and the `tl` CLI, logged in to your project:
+
+  ```shell
+  curl -fsSL https://tensorlake.ai/install | sh
+  tl login
+  ```
+
+- An OpenShell control plane on Tensorlake, added to your CLI as the current
+  gateway. Refer to
+  [Run the Control Plane on Tensorlake](/how-it-works/sandboxes/tensorlake#run-the-control-plane-on-tensorlake).
+  Note the name of its sandbox image. The default is `openshell-tensorlake`.
+- An OpenRouter API key.
+
+You don't need Docker. Tensorlake builds the image for you.
+
+<Steps toc={true}>
+
+## Build the OpenCode Image
+
+A Tensorlake sandbox image for OpenShell must start from the sandbox image of
+your control plane, because the agent VM needs the OpenShell launcher and
+runtime from it. This Dockerfile adds the OpenCode binary on top. Save it as
+`Dockerfile`:
+
+```dockerfile
+FROM openshell-tensorlake
+
+ARG OPENCODE_VERSION=1.19.3
+RUN curl -fsSL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" \
+    | tar -xz -C /usr/local/bin opencode \
+    && chmod 0755 /usr/local/bin/opencode \
+    && /usr/local/bin/opencode --version
+```
+
+If your control plane uses another sandbox image name, change the `FROM`
+line to match. Tensorlake does not expand variables in `FROM`.
+
+Two details matter here:
+
+- The binary goes at `/usr/local/bin/opencode`, because that's the only path
+  the OpenRouter provider profile allows.
+- The Dockerfile downloads the glibc release from GitHub. The official
+  `ghcr.io/anomalyco/opencode` image is Alpine, and its binary needs the musl
+  loader, which the Ubuntu-based sandbox image doesn't have.
+
+Build the image on Tensorlake:
+
+```shell
+tl sbx image create Dockerfile \
+  --registered-name openshell-tensorlake-opencode --cas
+```
+
+The build takes about a minute and ends with the registered image name.
+
+## Give OpenCode Access to OpenRouter
+
+A sandbox has no network access until you grant it. To let OpenCode reach
+OpenRouter, create a provider, which stores your API key and opens access to
+the service. OpenCode only ever sees a placeholder for the key. The guard
+swaps in the real key when OpenCode calls OpenRouter, and sends it nowhere
+else.
+
+Import the
+[OpenRouter profile](https://github.com/NVIDIA/OpenShell/blob/main/providers/openrouter.yaml)
+and create a provider named `openrouter`:
+
+```shell
+openshell profile import \
+  --url https://raw.githubusercontent.com/NVIDIA/OpenShell/main/providers/openrouter.yaml
+
+OPENROUTER_API_KEY=your-key \
+  openshell provider create \
+    --name openrouter \
+    --type openrouter \
+    --from-existing
+```
+
+Replace `your-key` with your OpenRouter API key, or drop that prefix if
+`OPENROUTER_API_KEY` is already set in your shell. The profile allows only
+`/usr/local/bin/opencode` to reach `openrouter.ai`.
+
+## Start OpenCode in a Sandbox
+
+Create a sandbox from the image, attach the provider, and start OpenCode with
+the free model:
+
+```shell
+openshell sandbox create \
+  --name opencode \
+  --from openshell-tensorlake-opencode \
+  --provider openrouter \
+  -- opencode -m openrouter/nvidia/nemotron-3.5-lightning:free
+```
+
+The CLI shows each launch step: the VM request, the VM start, the launch bundle
+upload, and the wait for the guard. The first boot takes 30 to 60 seconds.
+Then OpenCode opens, and everything after `--` runs inside the agent VM.
+
+Send OpenCode a prompt:
+
+```text
+Reply with exactly: OK from the sandbox
+```
+
+The guard VM forwards the request to OpenRouter and returns the answer over
+the channel. The agent VM never opens a connection of its own.
+
+## Confirm the Agent VM Is Isolated
+
+Leave OpenCode running and open another terminal. Three checks show what the
+agent VM can reach, what it knows about your key, and how Tensorlake sees it.
+First, show that the agent VM has no network of its own:
+
+```shell
+openshell sandbox exec -n opencode -- curl -sS --max-time 5 https://example.com
+```
+
+The connection fails at once. The Tensorlake network policy on the agent VM
+turns off every outbound connection. The agent VM can only reach the guard.
+
+Next, show what the agent sees of your key:
+
+```shell
+openshell sandbox exec -n opencode -- \
+  sh -c 'printf "%.10s\n" "$OPENROUTER_API_KEY"'
+```
+
+The value starts with `openshell:`. It's a placeholder. The guard VM stores
+the real key in a directory the agent VM can't read.
+
+Finally, look at the two VMs from the Tensorlake side:
+
+```shell
+tl sbx ls
+```
+
+You'll see one VM named `openshell-<id>` for the agent and one named
+`openshell-<id>-guard` for the guard, plus your control plane.
+
+## Grant Access When OpenCode Needs It
+
+Back in OpenCode, ask it to reach a host the policy doesn't allow:
+
+```text
+Run this shell command and report its output: curl -sS https://pypi.org/simple/requests/
+```
+
+OpenCode runs the command and reports that the connection failed. OpenShell
+denied it and drafted a rule for it. From the other terminal, list the
+proposals:
+
+```shell
+openshell rule get opencode --status pending
+```
+
+You'll see a narrow rule that allows `/usr/bin/curl` to reach `pypi.org:443`.
+You may also see rules for hosts OpenCode tried on its own, such as
+`registry.npmjs.org` and `models.opencode.ai`. Each proposal shows the result
+of the [policy prover](/how-it-works/policies/prover), which checks the rule
+against the current policy. Approve the PyPI rule with its chunk ID:
+
+```shell
+openshell rule approve opencode --chunk-id <chunk-id>
+```
+
+The gateway pushes the rule to the running sandbox within 30 seconds, without
+a restart. Ask OpenCode to run the same command again, and this time it
+returns the page. Leave the other proposals pending, or reject them:
+
+```shell
+openshell rule reject opencode --chunk-id <chunk-id> --reason "Not needed."
+```
+
+## Stop and Start the Sandbox
+
+A stopped sandbox keeps its disks, so OpenCode's files and the approved rule
+survive a restart. To show this, ask OpenCode to write a file:
+
+```text
+Write the text "hello" to a file named keep.txt
+```
+
+Then stop the sandbox from the other terminal:
+
+```shell
+openshell sandbox stop opencode
+```
+
+Both VMs suspend in about 10 seconds. Tensorlake keeps their disks. Start the
+sandbox again:
+
+```shell
+openshell sandbox start opencode
+```
+
+The sandbox is ready in about 10 seconds, with fresh credentials and the same
+disks. OpenCode starts again as the main process. Check that the file and the
+approved rule are still there:
+
+```shell
+openshell sandbox exec -n opencode -- cat /sandbox/keep.txt
+openshell sandbox exec -n opencode -- \
+  curl -sS --max-time 5 https://pypi.org/simple/requests/
+```
+
+## Clean Up
+
+When you're finished, delete the sandbox. OpenShell deletes both VMs:
+
+```shell
+openshell sandbox delete opencode
+```
+
+</Steps>
+
+## Troubleshooting
+
+- If the sandbox fails with `LaunchFailed` and `No such file or directory`,
+  the image doesn't start from your control plane's sandbox image. Check the
+  `FROM` line. An image from `tl sbx image import` fails the same way, because
+  it lacks the OpenShell launcher.
+- If `opencode` fails with `cannot execute: required file not found`, the
+  binary targets Alpine. Use the glibc release as the Dockerfile above does.
+- If the guard denies OpenCode's requests to OpenRouter, make sure the binary
+  is at `/usr/local/bin/opencode`, the path the profile allows.
+- If the guard still denies a request after you approve its rule, wait 30
+  seconds and try again. The gateway pushes the new policy to the guard on its
+  next sync.
+
+## Next Steps
+
+- To understand the two-VM layout, the tunnel, and what each party can reach,
+  refer to [Tensorlake Runtime](/how-it-works/sandboxes/tensorlake).
+- To let OpenCode propose its own rules, or to approve proposals automatically
+  when the prover finds no new risk, refer to
+  [Policy Advisor](/how-it-works/policies/advisor).
+- To give OpenCode your own code, upload a directory with `--upload`. Refer to
+  [Transfer Files](/how-it-works/sandboxes/overview#transfer-files).
