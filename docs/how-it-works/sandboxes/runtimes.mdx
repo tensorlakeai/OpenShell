@@ -21,6 +21,7 @@ the sandbox record and driver-supported persistent storage.
 | [Podman](#podman-driver) | `podman` | Rootless Linux workstations without a Docker daemon. |
 | [MicroVM](#microvm-driver) | `vm` | Workloads need a VM boundary instead of a container boundary. |
 | [Kubernetes](#kubernetes-driver) | `kubernetes` | Shared clusters, remote compute, and GPU scheduling. |
+| [Tensorlake](/how-it-works/sandboxes/tensorlake) | `tensorlake` | Remote microVMs without local virtualization. Experimental. |
 | Windows MXC | `mxc` | Coming soon. |
 
 ## Select a Compute Driver
@@ -73,7 +74,7 @@ compute_driver = "kyma"
 socket_path = "/run/openshell/kyma.sock"
 ```
 
-The gateway does not start or supervise extension drivers. Restrict the socket so only the gateway user can access it.
+The gateway does not start or supervise extension drivers. Restrict the socket so only the gateway user can access it. The [Tensorlake](/how-it-works/sandboxes/tensorlake) driver is an extension driver that ships in this repository.
 
 ## Size Sandboxes
 

@@ -1,0 +1,93 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Tensorlake Images
+
+# Build and register the Tensorlake sandbox and control-plane images with
+# crates/openshell-driver-tensorlake/build-images.sh. Tensorlake runs the
+# Docker builds, so this job needs only the `tl` CLI and an API key.
+#
+# Run it by hand. A build with `public: true` registers the pair for every
+# Tensorlake project under a versioned name. The version comes from the
+# checkout: run the workflow from a release tag to publish that release
+# (v0.1.6 -> openshell-tensorlake-0-1-6), or from a branch to publish a
+# build named after its short commit. Public names are permanent. Set
+# `version` only when you need a name the checkout does not give you.
+#
+# Required secret: TENSORLAKE_API_KEY, a key for the Tensorlake project that
+# owns the images.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image version suffix. Default: the release tag on the checkout as 0-1-6, or the short commit."
+        required: false
+        type: string
+        default: ""
+      public:
+        description: "Register the images for all Tensorlake projects."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tensorlake-images-${{ inputs.version || github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build Tensorlake images
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The build script names a public pair after the release tag on HEAD.
+          fetch-tags: true
+
+      - name: Check inputs
+        env:
+          VERSION: ${{ inputs.version }}
+          PUBLIC: ${{ inputs.public }}
+        run: |
+          set -euo pipefail
+          if [ -n "${VERSION}" ] && ! [[ "${VERSION}" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+            echo "::error::version must contain only lowercase letters, digits, and dashes" >&2
+            exit 1
+          fi
+
+      - name: Install the Tensorlake CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL https://tensorlake.ai/install | sh
+          echo "${HOME}/.tensorlake/bin" >> "${GITHUB_PATH}"
+
+      - name: Build and register the images
+        env:
+          TENSORLAKE_API_KEY: ${{ secrets.TENSORLAKE_API_KEY }}
+          VERSION: ${{ inputs.version }}
+          PUBLIC: ${{ inputs.public == true && '1' || '' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TENSORLAKE_API_KEY}" ]; then
+            echo "::error::the TENSORLAKE_API_KEY secret is not set" >&2
+            exit 1
+          fi
+          tl whoami
+          crates/openshell-driver-tensorlake/build-images.sh | tee build-images.log
+          {
+            echo "## Tensorlake images"
+            echo
+            echo '```'
+            sed -n '/^Registered:/,$p' build-images.log
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
