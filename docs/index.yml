@@ -44,6 +44,8 @@ navigation:
       path: how-it-works/sandboxes/templates.mdx
     - page: "Runtimes"
       path: how-it-works/sandboxes/runtimes.mdx
+    - page: "Tensorlake"
+      path: how-it-works/sandboxes/tensorlake.mdx
   - section: "Providers"
     slug: providers
     contents:
@@ -113,6 +115,9 @@ navigation:
     path: tutorials/github-push-access.mdx
   - page: "Microsoft Graph Provider Refresh"
     path: tutorials/microsoft-graph-provider-refresh.mdx
+  - page: "OpenCode on Tensorlake"
+    path: tutorials/run-opencode-on-tensorlake.mdx
+    slug: run-opencode-on-tensorlake
 - section: "SDK Reference"
   slug: sdk
   contents:

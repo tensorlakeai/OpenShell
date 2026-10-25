@@ -4611,6 +4611,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-driver-tensorlake"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "futures",
+ "miette",
+ "openshell-core",
+ "openshell-crypto",
+ "openshell-isolation-interface",
+ "openshell-otel",
+ "openshell-sandbox-backend",
+ "prost",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tar",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "openshell-driver-vault"
 version = "0.0.0"
 dependencies = [
@@ -8224,6 +8249,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
