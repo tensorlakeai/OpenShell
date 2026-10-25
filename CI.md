@@ -327,6 +327,7 @@ Pre-release builds, then publishes and calls `release-qualification.yml` in
 parallel within the same run, using native job dependencies.
 Its platform package artifacts are uploaded after versioned images and the chart,
 so the installer can use them while qualification runs or after it fails.
+The pre-release snap artifact is published to the `latest/beta` channel.
 The implemented `release-tag-v1` profile is an incremental subset of RFC 0014
 qualification. Failed checks fail the parent workflow and retain evidence in Actions.
 
@@ -617,6 +618,8 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/actions/setup-e2e-*` | Shared artifact, Podman, KVM, and kind setup used by the runtime lanes. |
 | `.github/workflows/helm-lint.yml` | Helm chart validation. PR mirror pushes skip lint jobs unless Helm inputs changed; merge groups always validate Helm because they represent the final integration state. |
 | `.github/actions/setup-nix/action.yml` | Installs Nix and configures the OpenShell Cachix cache, using read-only cache access when no authentication token is available. |
+| `.github/actions/setup-rust/action.yml` | Restores the Rust target and registry cache. Other branches can restore only their own caches and `main`'s, so per-binary release build caches are saved only on `main`. |
+| `.github/workflows/rust-cache.yml` | Builds the Branch Checks test targets on each push to `main` to save the `rust-checks` cache that PR mirrors and merge groups restore. Skips the build when the cache already matches. |
 | `.github/actions/pr-gate/action.yml` | Composite action that resolves PR metadata and verifies the required label is set for PR mirror pushes. Non-push events are allowed through. |
 | `.github/actions/pr-merge-base/action.yml` | Composite action that resolves and fetches the merge-base commit for `pull-request/<N>` push workflows. |
 | `.github/workflows/required-ci-gates.yml` | Posts required PR-head and merge-group statuses for gated CI workflows. This is what branch protection and merge queue should require. |
@@ -644,7 +647,7 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | `.github/workflows/release-notes.yml` | Shared prompt-driven release notes generation through Inference Hub, used by prerelease previews, notes-only previews, and stable publication when no preview is reused. |
 | `.github/workflows/release-qualification.yml` | Reusable qualification suites and result aggregation. Runs security scans, conformance and feature integration, Docker and VM E2E, protobuf compatibility, and advisory compatibility review. |
 | `.github/workflows/snap-package.yml` | Builds snap and component artifacts for Release Dev, Release, and Pre-release without Store credentials or publication. |
-| `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts to the Store without rebuilding. Release Dev calls it directly for `latest/edge` after snap builds and requires it to succeed before creating the dev release. Release calls it through `release-publish.yml` for `latest/stable` after qualification and release publication succeed. |
+| `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts directly to a Store channel without rebuilding. Release Dev uses `latest/edge`, Pre-release uses `latest/beta`, and Release uses `latest/stable` for the stable rebuild. Uploads queue per channel and architecture, so tagged beta and stable jobs recheck repository tags after earlier publication finishes and before updating their floating channels. |
 | `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The `ubuntu-snap-system-docker` job verifies a compatible system Docker lifecycle, while `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
 
 ## Required status contexts

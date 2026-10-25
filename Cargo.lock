@@ -1492,9 +1492,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "12218662ccac37d9714f2191252553d67585b97df8c839cbe49e0bde278dc865"
 dependencies = [
  "cmov",
  "subtle",
@@ -4346,11 +4346,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "tokio-rustls",
  "tokio-stream",
- "tokio-tungstenite 0.26.2",
  "tonic",
- "tower",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -4508,16 +4505,19 @@ dependencies = [
  "openshell-otel-test-support",
  "openshell-policy",
  "openshell-sandbox-backend",
+ "openshell-supervisor-control",
  "opentelemetry",
  "opentelemetry_sdk",
  "prost",
  "prost-types",
  "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "temp-env",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "toml",
  "tonic",
@@ -5056,6 +5056,7 @@ dependencies = [
  "openshell-policy",
  "openshell-prover",
  "openshell-providers",
+ "openshell-supervisor-control",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
  "opentelemetry",
@@ -5106,20 +5107,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "openshell-server-macros"
-version = "0.0.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "openshell-supervisor"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "clap",
  "futures",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "miette",
  "nix 0.29.0",
  "openshell-core",
@@ -5130,6 +5127,7 @@ dependencies = [
  "openshell-otel",
  "openshell-policy",
  "openshell-sandbox-backend",
+ "openshell-supervisor-control",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
  "openshell-supervisor-network",
@@ -5146,6 +5144,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
+ "tokio-stream",
  "tokio-tungstenite 0.26.2",
  "tonic",
  "tonic-prost",
@@ -5153,6 +5153,23 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "openshell-supervisor-control"
+version = "0.0.0"
+dependencies = [
+ "openshell-core",
+ "openshell-otel",
+ "openshell-sandbox-backend",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]
